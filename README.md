@@ -6,6 +6,9 @@ Suggested usage:
    wget -qO- \
      https://raw.githubusercontent.com/HurlesGroupSanger/trio-dnm-calling/refs/heads/main/install.sh |
      bash -s install_dir
+
+   # set the paths: either add to your profile or execute before running the pipelines below
+   . install_dir/setenv.sh
    ```
 2. Call candidate DNM sites
    ```
