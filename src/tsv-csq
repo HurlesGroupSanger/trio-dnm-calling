@@ -1,0 +1,326 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $opts = parse_params();
+add_csq($opts);
+
+exit;
+
+#--------------------------------
+
+sub error
+{
+    my (@msg) = @_;
+    if ( scalar @msg ) { confess @msg; }
+    print
+        "About: Use `bcftools csq` to predict consequences in tab-delimited text files\n",
+        "Usage: tsv-csq [OPTIONS]\n",
+        "Options:\n",
+        "   -a, --csq-args STR              Arguments to pass to `bcftools csq`\n",
+        "   -c, --columns LIST[:CSQ[,GENE]] Column names or 1-based indexes, optionally the column indices to be\n",
+        "                                     overwritten with the consequence and gene name [CHROM,POS,REF,ALT]\n",
+        "   -f, --fasta-ref FILE            Reference sequence\n",
+        "   -g, --gff FILE                  GFF3 annotation file, see `bcftools csq` usage page\n",
+        "   -i, --input FILE                Input file\n",
+        "   -o, --output FILE               Output file\n",
+        "   -t, --temp-dir DIR              Where to put temporary files\n",
+        "   -h, -?, --help                  This help message\n",
+        "Example:\n",
+        "   # In case the input file has a header (such as '#chr pos ref alt'), use the -c option\n",
+        "   # to indicate which of the columns constitute chr,pos,ref,alt.\n",
+        "   tsv-csq -c chr,pos,ref,alt:csq -i input.txt.gz -o output.txt.gz -t rmme -g annots.gff3.gz -f ref.fa\n",
+        "\n",
+        "   # When there is no header, use 1-based column indices to indicate which correspond to chr,pos,ref,alt.\n",
+        "   # For example, if these columns appear in the reverse order than in the example above, use\n",
+        "   tsv-csq -c 4,3,2,1 -i input.txt.gz -o output.txt.gz -t rmme -g annots.gff3.gz -f ref.fa\n",
+        "\n";
+    exit -1;
+}
+sub parse_params
+{
+    my $opts =
+    {
+        columns => 'CHROM,POS,REF,ALT',
+        csq_args => '',
+    };
+    if ( -t STDIN && !@ARGV ) { error(); }
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-a' or $arg eq '--csq-args' ) { $$opts{csq_args}=shift(@ARGV); next }
+        if ( $arg eq '-c' or $arg eq '--columns' ) { $$opts{columns}=shift(@ARGV); next }
+        if ( $arg eq '-t' or $arg eq '--temp-dir' ) { $$opts{tmpdir}=shift(@ARGV); next }
+        if ( $arg eq '-i' or $arg eq '--input' ) { $$opts{input}=shift(@ARGV); next }
+        if ( $arg eq '-o' or $arg eq '--output' ) { $$opts{output}=shift(@ARGV); next }
+        if ( $arg eq '-f' or $arg eq '--fasta-ref' ) { $$opts{ref}=shift(@ARGV); next }
+        if ( $arg eq '-g' or $arg eq '--gff' ) { $$opts{gff}=shift(@ARGV); next }
+        if ( $arg eq '-?' or $arg eq '-h' or $arg eq '--help' ) { error(); }
+        error("Unknown parameter \"$arg\". Run -h for help.\n");
+    }
+    if ( !exists($$opts{tmpdir}) ) { error("Missing the -t option.\n") }
+    if ( !exists($$opts{ref}) ) { error("Missing the -f option.\n") }
+    if ( !exists($$opts{gff}) ) { error("Missing the -g option.\n") }
+    if ( !exists($$opts{input}) ) { error("Missing the -i option.\n") }
+    if ( !exists($$opts{output}) ) { error("Missing the -o option.\n") }
+    return $opts;
+}
+
+sub cmd
+{
+    my ($cmd,%args) = @_;
+
+    if ( !exists($args{verbose}) ) { $args{verbose} = 1; }
+    if ( $args{verbose} ) { print STDERR $cmd,"\n"; }
+
+    # Why not to use backticks? Perl calls /bin/sh, which is often bash. To get the correct
+    #   status of failing pipes, it must be called with the pipefail option.
+
+    my $kid_io;
+    my $pid = open($kid_io, "-|");
+    if ( !defined $pid ) { error("Cannot fork: $!"); }
+
+    my @out;
+    if ($pid)
+    {
+        # parent
+        @out = <$kid_io>;
+        close($kid_io);
+    }
+    else
+    {
+        # child
+        exec('/bin/bash', '-o','pipefail','-c', $cmd) or error("Failed to run the command [/bin/sh -o pipefail -c $cmd]: $!");
+    }
+
+    my $status  = $? >> 8;
+    my $signal  = $? & 127;
+
+    my $require_status = exists($args{require_status}) ? $args{require_status} : 0;
+    my $is_err = $status ne $require_status ? 1 : 0;
+
+    if ( exists($args{exit_on_error}) && !$args{exit_on_error} ) { return ($is_err,\@out); }
+    if ( $is_err )
+    {
+        my $msg;
+        if ( $status & 0xff )
+        {
+            $msg = "The command died with signal $signal";
+        }
+        else
+        {
+            $msg = "The command exited with status $status (expected $status)";
+        }
+        $msg .= ":\n\t$cmd\n\n";
+        if ( @out ) {  $msg .= join('',@out,"\n\n"); }
+        error($msg);
+    }
+    return ($is_err,\@out);
+}
+
+sub add_csq
+{
+    my ($opts) = @_;
+
+    # extract chr,pos,ref,alt columns, run through bcftools/csq
+    my ($part1,$part2) = split(/:/,$$opts{columns});
+    my @cols = split(/,/,$part1);  # mandatory part, column names of CHROM,POS,REF,ALT
+    my ($icsq,$igene);
+    if ( defined $part2 )
+    {
+        ($icsq,$igene) = split(/,/,$part2);
+    }
+    my $tab = parseTab->new(fname=>$$opts{input});
+    my ($ichr,$ipos,$iref,$ialt) = $tab->idx1(@cols);
+    if ( defined $icsq ) { ($icsq) = $tab->idx0($icsq); }
+    if ( defined $igene ) { ($igene) = $tab->idx0($igene); }
+    my ($ret,$chrs) = cmd(qq[zless $$opts{input} | grep -v ^# | cut -f$ichr | sort | uniq]);
+
+    # determine chr naming convention in the three files
+    my @chr_names = (qw(- - -));
+    if ( $$chrs[0]=~/^chr/i ) { $chr_names[0] = $&; }
+    my $name = (`zless $$opts{gff} | grep ^# | head -1`)[0];
+    if ( $name=~/^chr/i ) { $chr_names[1] = $&; }
+    $name = (`zless $$opts{ref} | head -1 | sed 's,^>,, ; s,\\s.*,,'`)[0];
+    if ( $name=~/^chr/i ) { $chr_names[2] = $&; }
+    my $unify = $$opts{csq_args} eq '' ? '--force --unify-chr-names '.join(',',@chr_names) : '';
+    cmd("mkdir -p $$opts{tmpdir}");
+    my $cmd_in  = qq[(zless $$opts{input} | grep ^#; zless $$opts{input} | grep -v ^# | sort -k$ichr,${ichr}d -k$ipos,${ipos}n -k$iref,${iref}d -k$ialt,${ialt}d)];
+    my $cmd_out = qq[bcftools csq $$opts{csq_args} $unify -l -f $$opts{ref} -g $$opts{gff} -o $$opts{tmpdir}/csq.vcf.gz];
+    print STDERR "$cmd_in\n";
+    open(my $in,"$cmd_in |") or error("zless $cmd_in: $!");
+    print STDERR "$cmd_out\n";
+    open(my $out,"| $cmd_out") or error("$cmd_out: $!");
+    print $out qq[##fileformat=VCFv4.2\n];
+    for my $chr (@$chrs)
+    {
+        chomp($chr);
+        print $out qq[##contig=<ID=$chr>\n];
+    }
+    print $out q[#].join("\t",qw(CHROM POS ID REF ALT QUAL FILTER INFO))."\n";
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my $dat = $tab->array($line,fields=>\@cols);
+        print $out join("\t",$$dat[0],$$dat[1],'.',$$dat[2],$$dat[3],'.','.','.')."\n";
+    }
+    close($in) or error("close failed: $cmd_in");
+    close($out) or error("close failed: $cmd_out");
+
+    # annotate the input
+    open($in,"$cmd_in |") or error("$cmd_in: $!");
+    my $cmd = qq[bcftools +split-vep -X -f'%CHROM\\t%POS\\t%REF\\t%ALT\\t%Consequence\\t%gene' -s worst $$opts{tmpdir}/csq.vcf.gz];
+    print STDERR "$cmd\n";
+    open(my $in_vcf,"$cmd |") or error("$cmd: $!");
+    open($out,"| gzip -c > $$opts{output}.part") or error("gzip -c > $$opts{output}.part: $!");
+    my $hdr_printed = 0;
+    while (my $line=<$in>)
+    {
+        my @line = split(/\t/,$line);
+        chomp($line[-1]);
+
+        if ( $line=~/^#/ )
+        {
+            if ( $hdr_printed ) { next; }
+            if ( !defined $icsq ) { push @line,'csq'; }
+            if ( !defined $igene ) { push @line,'gene'; }
+            print $out join("\t",@line)."\n";
+            $hdr_printed = 1;
+            next;
+        }
+        my $vcf = <$in_vcf>;
+        if ( !defined $vcf ) { error("Out of sync: $line\n"); }
+
+        my $dat = $tab->array(\@line,fields=>\@cols);
+        my $key = join('-',@$dat);
+        my @col = split(/\t/,$vcf);
+        chomp($col[-1]);
+        my $key_vcf = join('-',@col[0..3]);
+        if ( $key ne $key_vcf ) { error("Out of sync: $key vs $key_vcf\n"); }
+        if ( !defined $icsq ) { push @line,$col[-2]; }
+        else { splice(@line,$icsq,1,$col[-2]); }
+        if ( !defined $igene ) { push @line,$col[-1]; }
+        else { splice(@line,$igene,1,$col[-1]); }
+        print $out join("\t",@line)."\n";
+    }
+    my $vcf = <$in_vcf>;
+    if ( defined $vcf ) { error("Out of sync: $vcf\n"); }
+    close($in_vcf) or error("close failed: $cmd_in");
+    close($in) or error("close failed: zless $$opts{input}");
+    close($out) or error("close failed: gzip -c > $$opts{output}.part");
+    rename("$$opts{output}.part",$$opts{output}) or error("rename $$opts{output}.part $$opts{output}: $!");
+}
+
+
+#-------------------
+
+package parseTab;
+use strict;
+use warnings;
+use Carp;
+
+# Convenience script to deal with tab-delimited files
+#
+#   my $tab = parseTab->new();
+#   $tab->header($line);
+#   $tab->header(\@line);
+#
+#   my $tab = parseTab->new(fname=>$fname);       # reads header automatically
+#   my ($ichr0,$ipos0) = $tab->idx0(qw(chr pos));
+#   my ($ichr1,$ipos1) = $tab->idx1(qw(chr pos));
+#   my $name2idx0 = $tab->idx0(qw(chr pos));
+#
+#   $hash  = $tab->hash($line,fields=>[qw(chr pos)]);
+#   $hash  = $tab->hash(\@line,fields=>[qw(chr pos)]);
+#   $array = $tab->array($line,fields=>[qw(chr pos)]);
+#   $array = $tab->array(\@line,fields=>[qw(chr pos)]);
+#
+sub parseTab::new
+{
+    my ($class,@args) = @_;
+    my $self = @args ? {@args} : {};
+    bless $self, ref($class) || $class;
+    if ( exists($$self{fname}) )
+    {
+        my $line = (`zless $$self{fname} | head -1`)[0];
+        $self->header($line);
+    }
+    return $self;
+}
+sub parseTab::throw
+{
+    my ($self,@msg) = @_;
+    if ( scalar @msg ) { confess @msg; }
+    die $$self{usage};
+}
+sub parseTab::header
+{
+    my ($self,$line) = @_;
+    my @cols = $self->_split($line);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    $$self{name2idx0} = \%cols;
+    $$self{names} = \@cols;
+}
+sub parseTab::idx0
+{
+    my ($self,@names) = @_;
+    my @out = ();
+    for my $name (@names)
+    {
+        if ( !exists($$self{name2idx0}{$name}) ) { $self->throw("No such column: $name\n"); }
+        push @out,$$self{name2idx0}{$name};
+    }
+    return (@out);
+}
+sub parseTab::idx1
+{
+    my ($self,@names) = @_;
+    my @out = $self->idx0(@names);
+    for (my $i=0; $i<@out; $i++) { $out[$i]++; }
+    return (@out);
+}
+sub parseTab::_split
+{
+    my ($self,$line) = @_;
+    my @col = ref($line) eq 'ARRAY' ? @$line : split(/\t/,$line);
+    chomp($col[-1]);
+    return (@col);
+}
+sub parseTab::hash
+{
+    my ($self,$line,%args) = @_;
+    my $names = exists($args{fields}) ? $args{fields} : $$self{names};
+    my @col = $self->_split($line);
+    my %out = ();
+    for my $name (@$names)
+    {
+        my $idx = $$self{name2idx0}{$name};
+        $out{$name} = $col[$idx];
+    }
+    return \%out;
+}
+sub parseTab::array
+{
+    my ($self,$line,%args) = @_;
+    my $names = exists($args{fields}) ? $args{fields} : $$self{names};
+    my @col = $self->_split($line);
+    my @out = ();
+    for my $name (@$names)
+    {
+        my $idx = $$self{name2idx0}{$name};
+        push @out,$col[$idx];
+    }
+    return \@out;
+}
+

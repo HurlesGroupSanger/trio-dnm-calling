@@ -1,0 +1,370 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{config_version} = '1744708901';
+    $$self{verbose} = 1;
+    $$self{nbatch_mplp}  = 50;
+    $$self{nbatch_vrfs}  = 10;
+    $$self{PARs} = "chrX:10000-2781479,chrX:155701382-156030895";
+
+    $$self{_sampleconf} = q[
+
+        # Candidate sites to call DNMs (chr,pos,smpl)
+        sites => undef,
+
+        # List of bams and samples (bam,sample)
+        bam_smpl => undef,
+
+        # Path to a PED file with family structure (ignored,child,father,mother,1:male,2:female)
+        ped_file => undef,
+
+        # Reference file and its pseudoautosomal regions
+        fasta_ref => undef,
+        PARs => ']. $$self{PARs} .q[',
+
+        # GFF for consequence calling via bcftools/csq, e.g. http://ftp.ensembl.org/pub/current_gff3/homo_sapiens/
+        gff_file => undef,
+
+        # Reference samples for VRFS calculation, leave undefined if trio parents should be used
+        vrfs_bams => undef,
+
+
+        # Arguments to bcftools/mpileup, bcftools/trio-dnm and prefiltering
+        mpileup_args    => '-a AD,QS,SP,SCR,FMT/NMBZ -p --indels-cns -B',
+        trio_dnm_args   => '--pn 0.011,0:snv',
+        trio_dnm_filter => "--include 'DNM > -8 || DNG > -8'",
+
+
+        # Number of samples to process per mpileup and vrfs job
+        nbatch_mplp => ]. $$self{nbatch_mplp} .q[,
+        nbatch_vrfs => ]. $$self{nbatch_vrfs} .q[,
+
+        version => '] .$$self{config_version}. q[',
+        verbose => 1,
+
+    ]."\n";
+
+    $$self{usage} .=
+        "About: \n" .
+        "Usage: run-trio-dnm\n" .
+        "Options:\n" .
+        "   -o, --outdir DIR            Output directory\n" .
+        "   -s, --sites FILE            Candidate DNM sites to verify: chr,pos,sample\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-s' or $arg eq '--sites' ) { $$self{sites}=shift(@ARGV); next; }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !defined($$self{sites}) ) { $self->throw("Expected the sites key"); }
+    if ( !defined($$self{ped_file}) ) { $self->throw("Expected the ped_file key"); }
+    if ( !defined($$self{gff_file}) ) { $self->throw("Expected the gff_file key"); }
+    if ( !defined($$self{bam_smpl}) ) { $self->throw("Expected the bam_smpl key"); }
+    if ( !defined($$self{outdir}) ) { $self->throw("Expected the -o option"); }
+    $$self{outdir} =~ s{/+$}{};
+    if ( !exists($$self{version}) or $$self{version} ne $$self{config_version} )
+    {
+        $self->throw("Warning: Your config file may be out of date, the latest version key is \"$$self{config_version}\". Please run with +sampleconf to see what changed.\n");
+    }
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("run-trio-dnm.conf");
+
+    my $jobs = $self->read_jobs();
+
+    if ( !$self->is_finished("$$self{outdir}/trio-dnm.sites.txt.gz") )
+    {
+        for (my $i=0; $i<@$jobs; $i+=$$self{nbatch_mplp})
+        {
+            my $iend = $i + $$self{nbatch_mplp} - 1;
+            if ( $iend >= @$jobs ) { $iend = @$jobs - 1; }
+            if ( $iend < $i ) { last; }
+            $self->spawn('trio_dnm_mpileup',"$$self{outdir}/trio-dnm/$i.done",[@$jobs[$i..$iend]]);
+        }
+        $self->wait;
+
+        $self->spawn('extract_sites',"$$self{outdir}/trio-dnm.sites.txt.gz","$$self{outdir}/trio-dnm");
+        $self->wait;
+    }
+
+    if ( !$self->is_finished("$$self{outdir}/vrfs.txt.gz") )
+    {
+        # determine the number of batches
+        my $nbatch = (grep {chomp} $self->cmd(qq[bcftools +vrfs -a $$self{outdir}/vrfs-bams.txt -b k=$$self{nbatch_vrfs} | grep -v ^#]))[0];
+
+        $self->cmd("mkdir -p $$self{outdir}/vrfs");
+        for (my $i=1; $i<=$nbatch; $i++)
+        {
+            my $outfile = "$$self{outdir}/vrfs/$i.txt.gz";
+            my $cmd =
+                qq[bcftools +vrfs -f $$self{fasta_ref} -a $$self{outdir}/vrfs-bams.txt -s $$self{outdir}/trio-dnm.sites.txt.gz] .
+                qq[ -o $$self{outdir}/vrfs/part.$i.txt.gz -b $i/$nbatch -iv ] .
+                qq[ && mv $$self{outdir}/vrfs/part.$i.txt.gz $outfile];
+            $self->spawn('run_cmd',$outfile,$cmd);
+        }
+        $self->wait;
+
+        my $outfile = "$$self{outdir}/vrfs.txt.gz";
+        my $cmd =
+            qq[bcftools +vrfs -M $$self{outdir}/vrfs/*.txt.gz -o $outfile.partx -Oz && ] .
+            qq[ gunzip -c $outfile.partx | grep ^SITE | cut -f2- | gzip -c > $outfile.part && ] .
+            qq[ mv $outfile.part $outfile && ] .
+            qq[ mv $outfile.partx $$self{outdir}/vrfs.raw.txt.gz];
+        $self->spawn('run_cmd',$outfile,$cmd);
+        $self->wait;
+    }
+
+    if ( !$self->is_finished("$$self{outdir}/trio-dnm.vcfs.txt") )
+    {
+        $self->cmd(qq[find $$self{outdir}/trio-dnm | grep \\.bcf\$ > $$self{outdir}/trio-dnm.vcfs.txt.part && mv $$self{outdir}/trio-dnm.vcfs.txt.part $$self{outdir}/trio-dnm.vcfs.txt]);
+    }
+
+    $self->spawn('extract_annots',"$$self{outdir}/annotated.sites.txt.gz");
+    $self->wait;
+
+
+    $self->all_done;
+}
+
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub run_cmd
+{
+    my ($self,$outfile,$cmd) = @_;
+    $self->cmd($cmd);
+    `touch $outfile`;
+}
+
+sub read_bam_smpl
+{
+    my ($self) = @_;
+    for my $line ($self->cmd("zless $$self{bam_smpl}"))
+    {
+        chomp($line);
+        my ($bam,$smpl) = split(/\s+/,$line);
+        $$self{bam2smpl}{$bam}  = $smpl;
+        $$self{smpl2bam}{$smpl} = $bam;
+    }
+}
+sub read_ped
+{
+    my ($self) = @_;
+    for my $line ($self->cmd("zless $$self{ped_file}"))
+    {
+        chomp($line);
+        my ($trio,$proband,$father,$mother) = split(/\t/,$line);
+        $$self{ped}{$trio}    = [$proband,$father,$mother];
+        $$self{ped}{$proband} = [$proband,$father,$mother];
+        $$self{ped}{$mother}  = [$proband,$father,$mother];
+        $$self{ped}{$father}  = [$proband,$father,$mother];
+    }
+}
+sub read_jobs
+{
+    my ($self) = @_;
+
+    if ( !$self->is_finished("$$self{outdir}/jobs.txt") )
+    {
+        $self->read_bam_smpl;
+        $self->read_ped;
+
+        $self->cmd(qq[mkdir -p $$self{outdir}/regions]);
+        my ($fh,$prev_smpl,%smpl,$cmd_fh);
+        my $cmd = qq[zless $$self{sites} | sort -k3,3d -k1,1d -k2,2n |];
+        open(my $in,$cmd) or $self->cmd("$cmd: $!");
+        while (my $line=<$in>)
+        {
+            chomp($line);
+            my ($chr,$pos,$smpl) = split(/\t/,$line);
+            if ( defined $fh && $prev_smpl ne $smpl )
+            {
+                close($fh) or $self->cmd("close failed: $cmd_fh");
+                $fh = undef;
+            }
+            if ( !defined $fh )
+            {
+                $prev_smpl = $smpl;
+                $cmd_fh = qq[uniq | awk '{OFS="\\t"}{print \$1,\$2-20,\$2+20}' | gzip -c > $$self{outdir}/regions/$smpl.txt.gz];
+                print STDERR "$cmd_fh\n";
+                open($fh,"| $cmd_fh") or $self->cmd("$cmd_fh: $!");
+            }
+            if ( !exists($$self{ped}{$smpl}) ) { $self->throw("no such sample in $$self{ped_file}: $smpl"); }
+            print $fh join("\t",$chr,$pos)."\n";
+            my $trio = $$self{ped}{$smpl};
+            $smpl{$smpl} = { c=>$$trio[0],f=>$$trio[1],m=>$$trio[2] };
+        }
+        close($in) or $self->cmd("close failed: $cmd");
+        close($fh) or $self->cmd("close failed: $cmd_fh");
+
+        my %parents = ();
+        open($fh,'>',"$$self{outdir}/jobs.txt.part") or $self->cmd("$$self{outdir}/jobs.txt.part: $!");
+        for my $smpl (sort keys %smpl)
+        {
+            my ($c,$f,$m) = ($smpl{$smpl}{c},$smpl{$smpl}{f},$smpl{$smpl}{m});
+            if ( !exists($$self{smpl2bam}{$c}) ) { $self->throw("No bam for $c\n"); }
+            if ( !exists($$self{smpl2bam}{$f}) ) { $self->throw("No bam for $f\n"); }
+            if ( !exists($$self{smpl2bam}{$m}) ) { $self->throw("No bam for $m\n"); }
+            print $fh join("\t",$c,$f,$m,$$self{smpl2bam}{$c},$$self{smpl2bam}{$f},$$self{smpl2bam}{$m},"$$self{outdir}/regions/$smpl.txt.gz")."\n";
+            $parents{$$self{smpl2bam}{$f}} = 1;
+            $parents{$$self{smpl2bam}{$m}} = 1;
+        }
+        close($fh) or $self->cmd("close failed: $$self{outdir}/jobs.txt.part");
+
+        if ( !defined($$self{vrfs_bams}) )
+        {
+            open($fh,'>',"$$self{outdir}/vrfs-bams.txt") or $self->cmd("$$self{outdir}/vrfs-bams.txt: $!");
+            for my $bam (sort keys %parents)
+            {
+                print $fh "$bam\n";
+            }
+            close($fh) or $self->cmd("close failed: $$self{outdir}/vrfs-bams.txt");
+        }
+        else
+        {
+            $self->cmd("cp $$self{vrfs_bams} $$self{outdir}/vrfs-bams.txt");
+        }
+        rename("$$self{outdir}/jobs.txt.part","$$self{outdir}/jobs.txt");
+    }
+
+    my @jobs = ();
+    for my $line (grep { chomp } $self->cmd("cat $$self{outdir}/jobs.txt"))
+    {
+        chomp($line);
+        my ($c,$f,$m,$cb,$fb,$mb,$reg) = split(/\t/,$line);
+        push @jobs,{ smpl=>$c, c=>$c,f=>$f,m=>$m, cb=>$cb,fb=>$fb,mb=>$mb, reg=>$reg };
+    }
+    return \@jobs;
+}
+
+sub trio_dnm_mpileup
+{
+    my ($self,$outfile,$jobs) = @_;
+
+    my $dir = $outfile;
+    $dir =~ s/\.done$//;
+    $self->cmd("mkdir -p $dir");
+
+    for my $job (@$jobs)
+    {
+        my $vcf = "$dir/$$job{smpl}.bcf";
+        if ( -e $vcf ) { next; }
+        my $cmd =
+        qq[
+            bcftools mpileup -f $$self{fasta_ref} $$self{mpileup_args} -R $$job{reg} -Ou $$job{cb} $$job{fb} $$job{mb}  |
+                bcftools call -mA -Ou |
+                bcftools norm -f $$self{fasta_ref} -Ou |
+                bcftools +trio-dnm2 -P $$self{ped_file} --strictly-novel $$self{trio_dnm_args} -Ou |
+                bcftools +trio-dnm2 -P $$self{ped_file} --strictly-novel --ppl --dnm-tag DNG:log --vaf DNG_VAF --va DNG_VA -Ou |
+                bcftools view $$self{trio_dnm_filter} -Ob -o $vcf.part &&
+            bcftools index $vcf.part &&
+            mv $vcf.part.csi $vcf.csi &&
+            mv $vcf.part $vcf
+        ];
+        $self->cmd($cmd);
+    }
+    $self->cmd("touch $outfile");
+}
+
+sub extract_sites
+{
+    my ($self,$outfile,$dir) = @_;
+    my $cmd = qq[| sort -k1,1d -k2,2n | uniq | gzip -c > $outfile.part];
+    print STDERR "$cmd\n";
+    open(my $fh,$cmd) or $self->throw("$cmd: $!");
+    my @files = glob("$dir/[0-9]*/*.bcf");
+    for my $file (@files)
+    {
+        my $cmd2 = qq[bcftools norm -m -any -f $$self{fasta_ref} -Ou $file | bcftools query -f "%CHROM\\t%POS\\t%REF\\t%ALT\\n" |];
+        print STDERR "$cmd2\n";
+        open(my $in,$cmd2) or $self->throw("$cmd2: $!");
+        while (my $line=<$in>)
+        {
+            chomp($line);
+            my ($chr,$pos,$ref,$alts) = split(/\t/,$line);
+            for my $alt (split(/,/,$alts))
+            {
+                if ( $alt eq '.' ) { next; }
+                print $fh join("\t",$chr,$pos,$ref,$alt)."\n";
+            }
+        }
+        close($in) or $self->throw("close failed: $cmd2");
+    }
+    close($fh) or $self->throw("close failed: $cmd");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub extract_annots
+{
+    my ($self,$outfile) = @_;
+    if ( !$self->is_finished("$outfile.part") )
+    {
+        $self->cmd(
+            qq[extract-trio-annots ] .
+            qq[ --trio-dnm-list $$self{outdir}/trio-dnm.vcfs.txt ] .
+            qq[ --fasta-reference $$self{fasta_ref} ] .
+            qq[ --PARs $$self{PARs} ] .
+            qq[ --ped-file $$self{ped_file} ] .
+            (defined($$self{af_tag} && defined($$self{af_file})) ? qq[ --allele-frequencies $$self{af_tag} $$self{af_file} ] : '') .
+            qq[ --output-file $outfile.part ]);
+    }
+
+    if ( !$self->is_finished("$outfile.partx") )
+    {
+        $self->cmd(qq[tsv-csq -c chr,pos,ref,alt -i $outfile.part -o $outfile.partx -t $$self{outdir}/rmme -g $$self{gff_file} -f $$self{fasta_ref}]);
+    }
+
+    $self->cmd(
+        qq[annot-tsv -s $$self{outdir}/vrfs.txt.gz -t $outfile.partx -c 1,2,2:chr,pos,pos -m 3,4:ref,alt -f 5,6:VRFS,VRFS_dist | gzip -c > $outfile.partxx] .
+        qq[ && mv $outfile.partxx $outfile] .
+        qq[ && rm -f $outfile.part $outfile.partx]);
+}
+
+
