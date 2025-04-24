@@ -14,7 +14,7 @@ Suggested usage:
    ```
    # create and edit a config file
    cp install_dir/trio-dnm-calling/template.candidate-calls.conf candidates.conf
-   
+
    # run locally or run on a farm
    run-commands +config candidate-calls.conf -o out.candidates -i /path/to/input/vcfs +local
    run-commands +config candidate-calls.conf -o out.candidates -i /path/to/input/vcfs +loop 300
@@ -25,6 +25,6 @@ Suggested usage:
    cp install_dir/trio-dnm-calling/template.trio-dnm.conf trio-dnm.conf
 
    # run the pipeline, locally or on a farm
-   run-commands +config trio-dnm.conf -o outdir -i out.candidates/sites.txt.gz +local
-   run-commands +config trio-dnm.conf -o outdir -i out.candidates/sites.txt.gz +loop 300
+   run-trio-dnm +config trio-dnm.conf -o outdir -i out.candidates/sites.txt.gz +local
+   run-trio-dnm +config trio-dnm.conf -o outdir -i out.candidates/sites.txt.gz +loop 300
    ```
