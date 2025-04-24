@@ -25,6 +25,6 @@ Suggested usage:
    cp install_dir/trio-dnm-calling/template.trio-dnm.conf trio-dnm.conf
 
    # run the pipeline, locally or on a farm
-   run-trio-dnm +config trio-dnm.conf -o outdir -i out.candidates/sites.txt.gz +local
-   run-trio-dnm +config trio-dnm.conf -o outdir -i out.candidates/sites.txt.gz +loop 300
+   run-trio-dnm +config trio-dnm.conf -o outdir -s out.candidates/sites.txt.gz +local
+   run-trio-dnm +config trio-dnm.conf -o outdir -s out.candidates/sites.txt.gz +loop 300
    ```
