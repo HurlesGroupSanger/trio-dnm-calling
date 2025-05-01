@@ -18,7 +18,7 @@ if [ $# != 1 ]; then
     exit;
 fi
 
-dst_dir=$1
+dst_dir=`realpath $1`
 mkdir -p $dst_dir
 
 download_main=0
