@@ -26,13 +26,14 @@ sub new
 
     $$self{config_version} = '1744708901';
     $$self{verbose} = 1;
+    $$self{sites_win} = 30;
     $$self{nbatch_mplp}  = 50;
     $$self{nbatch_vrfs}  = 10;
     $$self{PARs} = "chrX:10000-2781479,chrX:155701382-156030895";
 
     $$self{_sampleconf} = q[
 
-        # Candidate sites to call DNMs (chr,pos,smpl)
+        # Candidate sites to call DNMs at (chr,pos,smpl)
         sites => undef,
 
         # List of bams and samples (bam,sample)
@@ -51,6 +52,9 @@ sub new
         # Reference samples for VRFS calculation, leave undefined if trio parents should be used
         vrfs_bams => undef,
 
+
+        # Include a small +/- region around each candidate site, this is to mark and filter clusters,
+        sites_win => ]. $$self{sites_win} .q[,
 
         # Arguments to bcftools/mpileup, bcftools/trio-dnm and prefiltering
         mpileup_args    => '-a AD,QS,SP,SCR,FMT/NMBZ -p --indels-cns -B',
@@ -232,7 +236,7 @@ sub read_jobs
             if ( !defined $fh )
             {
                 $prev_smpl = $smpl;
-                $cmd_fh = qq[uniq | awk '{OFS="\\t"}{print \$1,\$2-20,\$2+20}' | gzip -c > $$self{outdir}/regions/$smpl.txt.gz];
+                $cmd_fh = qq[uniq | awk '{OFS="\\t"}{print \$1,\$2-$$self{sites_win},\$2+$$self{sites_win}}' | gzip -c > $$self{outdir}/regions/$smpl.txt.gz];
                 print STDERR "$cmd_fh\n";
                 open($fh,"| $cmd_fh") or $self->cmd("$cmd_fh: $!");
             }
@@ -291,6 +295,7 @@ sub trio_dnm_mpileup
     my $dir = $outfile;
     $dir =~ s/\.done$//;
     $self->cmd("mkdir -p $dir");
+    my $win = $$self{sites_win}*2 + 1;
 
     for my $job (@$jobs)
     {
@@ -301,6 +306,7 @@ sub trio_dnm_mpileup
             bcftools mpileup -f $$self{fasta_ref} $$self{mpileup_args} -R $$job{reg} -Ou $$job{cb} $$job{fb} $$job{mb}  |
                 bcftools call -mA -Ou |
                 bcftools norm -f $$self{fasta_ref} -Ou |
+                bcftools +prune -a count -i 'type!="ref"' -k -w ${win}bp -Ou |
                 bcftools +trio-dnm2 -P $$self{ped_file} --strictly-novel $$self{trio_dnm_args} -Ou |
                 bcftools +trio-dnm2 -P $$self{ped_file} --strictly-novel --ppl --dnm-tag DNG:log --vaf DNG_VAF --va DNG_VA -Ou |
                 bcftools view $$self{trio_dnm_filter} -Ob -o $vcf.part &&

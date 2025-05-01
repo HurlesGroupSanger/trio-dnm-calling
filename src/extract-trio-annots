@@ -208,6 +208,7 @@ sub annots_open
         DNM
         DNG
         VCF_QUAL
+        CLUSTER_SIZE
         VAF
         MaxParentalVAF
         N_ALT SP MQBZ SCBZ NMBZ NMR NMA MAX_NMRA
@@ -232,13 +233,13 @@ sub annots_process_vcf
     my $src = (grep { chomp } `$$opts{bcftools} view -h $vcf | grep ^##source=`)[0];
     if ( !defined $src ) { $src = 'mpileup'; }
     else { $src =~ s/^##source=//; }
-    my $cmd = qq[$$opts{bcftools} query -u -f'%CHROM\\t%POS\\t%REF\\t%ALT\\t%QUAL\\t%NM[\\t%SAMPLE][\\t%DNM][\\t%VAF][\\t%VA][\\t%DNG][\\t%AD][\\t%SP]\\t%MQBZ\\t%SCBZ[\\t%SCR][\\t%NMBZ]\\n' $vcf];
+    my $cmd = qq[$$opts{bcftools} query -u -f'%CHROM\\t%POS\\t%REF\\t%ALT\\t%QUAL\\t%NM\\t%CLUSTER_SIZE[\\t%SAMPLE][\\t%DNM][\\t%VAF][\\t%VA][\\t%DNG][\\t%AD][\\t%SP]\\t%MQBZ\\t%SCBZ[\\t%SCR][\\t%NMBZ]\\n' $vcf];
     print STDERR "$cmd\n";
     open(my $fh,"$cmd |") or error("$cmd: $!");
     while (my $line=<$fh>)
     {
         chomp($line);
-        my ($chr,$pos,$ref_ori,$alt_ori,$qual,$nm2,
+        my ($chr,$pos,$ref_ori,$alt_ori,$qual,$nm2,$cluster_size,
             $proband,$father,$mother,
             $dnm,undef,undef,
             $vaf,$f_vaf,$m_vaf,
@@ -298,6 +299,7 @@ sub annots_process_vcf
             push @out,$dnm;
             push @out,$dng_dnm;
             push @out,$qual;
+            push @out,$cluster_size;
             push @out,$vaf;
             push @out,$max_parental_vaf;
             push @out,$n_alt;
