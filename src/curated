@@ -1,0 +1,158 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $opts = parse_params();
+&{$$opts{cmd}}($opts);
+
+exit;
+
+#--------------------------------
+
+sub error
+{
+    my (@msg) = @_;
+    if ( scalar @msg ) { confess @msg; }
+    print
+        "About: Manage curated calls (tab-delimited chr,pos,ref,alt,sample,status)\n",
+        "       where the convention for recroding the validation status is\n",
+        "           false     .. use for curation and remove from the final callset\n",
+        "           true      .. use for curation and force into the final callset\n",
+        "           false-xx  .. don't use for curation but remove from the final callset\n",
+        "           true-xx   .. don't use for curation but force into the final callset\n",
+        "           xx        .. record but don't use\n",
+        "Usage: curated CMD [OPTIONS] file file\n",
+        "Commands:\n",
+        "   merge       Merge two or more curated files\n",
+        "Options:\n",
+        "   -b, --bam-smpl FILE     File with a list of bam,sample\n",
+        "   -c, --config FILE       The config to run-trio-dnm\n",
+        "   -p, --ped FILE          File with family structure\n",
+        "   -h, -?, --help          This help message\n",
+        "\n";
+    exit -1;
+}
+sub parse_params
+{
+    my $opts = {};
+    if ( -t STDIN && !@ARGV ) { error(); }
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( !$$opts{cmd} )
+        {
+            if ( $arg eq 'merge' ) { $$opts{cmd} = \&cmd_merge; next; }
+            error("Unknown parameter \"$arg\". Run -h for help.\n");
+        }
+        if ( $arg eq '-b' or $arg eq '--bam-smpl' ) { $$opts{bam_smpl} = shift(@ARGV); next; }
+        if ( $arg eq '-c' or $arg eq '--config' ) { $$opts{config} = shift(@ARGV); next; }
+        if ( $arg eq '-p' or $arg eq '--ped' ) { $$opts{ped_file} = shift(@ARGV); next; }
+        if ( $arg eq '-?' or $arg eq '-h' or $arg eq '--help' ) { error(); }
+        if ( -e $arg ) { push @{$$opts{files}},$arg; next; }
+        error("Unknown parameter \"$arg\". Run -h for help.\n");
+    }
+    if ( !exists($$opts{cmd}) ) { error(); }
+    return $opts;
+}
+
+sub init_trio_bams
+{
+    my ($opts) = @_;
+    if ( exists($$opts{config}) )
+    {
+        open(my $fh,'<',$$opts{config}) or error("$$opts{config}: $!");
+        my @config_lines = <$fh>;
+        close($fh) or error("close failed: $$opts{config}");
+        my $config_str = join('',@config_lines);
+        my $x = eval "{ $config_str }";
+        if ( $@ ) { error("eval $$opts{config}: $@\n"); }
+        if ( !exists($$opts{bam_smpl}) && exists($$x{bam_smpl}) ) { $$opts{bam_smpl} = $$x{bam_smpl}; }
+        if ( !exists($$opts{ped_file}) && exists($$x{ped_file}) ) { $$opts{ped_file} = $$x{ped_file}; }
+    }
+    if ( exists($$opts{bam_smpl}) )
+    {
+        for my $line (`zless $$opts{bam_smpl}`)
+        {
+            chomp($line);
+            my ($bam,$smpl) = split(/\s+/,$line);
+            $$opts{bam2smpl}{$bam}  = $smpl;
+            $$opts{smpl2bam}{$smpl} = $bam;
+        }
+    }
+    if ( exists($$opts{ped_file}) )
+    {
+        my ($self) = @_;
+        for my $line (`zless $$opts{ped_file}`)
+        {
+            chomp($line);
+            my ($trio,$proband,$father,$mother) = split(/\t/,$line);
+            $$opts{ped}{$trio}    = [$proband,$father,$mother];
+            $$opts{ped}{$proband} = [$proband,$father,$mother];
+            $$opts{ped}{$mother}  = [$proband,$father,$mother];
+            $$opts{ped}{$father}  = [$proband,$father,$mother];
+
+            if ( exists($$opts{smpl2bam}{$proband}) && exists($$opts{smpl2bam}{$father}) && exists($$opts{smpl2bam}{$mother}) )
+            {
+                $$opts{trio_bams}{$proband} = join("\t",$$opts{smpl2bam}{$proband},$$opts{smpl2bam}{$father},$$opts{smpl2bam}{$mother});
+            }
+        }
+    }
+}
+sub read_curated
+{
+    my ($opts,$dat,$file) = @_;
+    if ( !defined $dat ) { $dat = {}; }
+    if ( !-e $file ) { return $dat; }
+    open(my $fh,"zless $file |") or error("zless $file: $!");
+    while (my $line=<$fh>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        chomp($line);
+        my @val = split(/\t/,$line);
+        my $key = join('-',@val[0..4]);
+        if ( !exists($$dat{$key}) or
+                $$dat{$key}[5] eq 'todo' or
+                $$dat{$key}[5] eq 'auto' or
+                $$dat{$key}[5] eq '.'
+           )
+        {
+            $$dat{$key} = \@val;
+        }
+    }
+    close($fh) or error("close failed: zless $file");
+    return $dat;
+}
+sub write_curated
+{
+    my ($opts,$dat,$file) = @_;
+    init_trio_bams($opts);
+    my $fh = \*STDOUT;
+    if ( defined $file )
+    {
+        if ( $file=~/\.gz$/i ) { open($fh,"| gzip -c > $file") or error("gzip -c > $file: $!"); }
+        else { open($fh,'>',$file) or error("$file: $!"); }
+    }
+    for my $key (sort keys %$dat)
+    {
+        my $smpl = $$dat{$key}[4];
+        my @out = @{$$dat{$key}}[0..5];
+        if ( exists($$opts{trio_bams}{$smpl}) ) { push @out,$$opts{trio_bams}{$smpl}; }
+        print $fh join("\t",@out)."\n";
+    }
+    if ( defined $file ) { close($fh) or error("close failed: $file"); }
+}
+
+sub cmd_merge
+{
+    my ($opts) = @_;
+    if ( !exists($$opts{files}) ) { error(); }
+    my $dat = undef;
+    for my $file (@{$$opts{files}}) { $dat = read_curated($opts,$dat,$file); }
+    write_curated($opts,$dat);
+}
+
+
