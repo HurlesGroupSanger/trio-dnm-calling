@@ -306,7 +306,7 @@ sub trio_dnm_mpileup
             bcftools mpileup -f $$self{fasta_ref} $$self{mpileup_args} -R $$job{reg} -Ou $$job{cb} $$job{fb} $$job{mb}  |
                 bcftools call -mA -Ou |
                 bcftools norm -f $$self{fasta_ref} -Ou |
-                bcftools +prune -a count -i 'type!="ref"' -k -w ${win}bp -Ou |
+                bcftools +prune -a count -i 'GT[0]="alt"' -k -w ${win}bp -Ou |
                 bcftools +trio-dnm2 -P $$self{ped_file} --strictly-novel $$self{trio_dnm_args} -Ou |
                 bcftools +trio-dnm2 -P $$self{ped_file} --strictly-novel --ppl --dnm-tag DNG:log --vaf DNG_VAF --va DNG_VA -Ou |
                 bcftools view $$self{trio_dnm_filter} -Ob -o $vcf.part &&
