@@ -1,0 +1,2198 @@
+#!/usr/bin/env perl
+#
+#   The MIT License
+#
+#   Copyright (C) 2025 Genome Research Ltd.
+#
+#   Author: Petr Danecek <pd3@sanger.ac.uk>
+#
+#   Permission is hereby granted, free of charge, to any person obtaining a copy
+#   of this software and associated documentation files (the "Software"), to deal
+#   in the Software without restriction, including without limitation the rights
+#   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+#   copies of the Software, and to permit persons to whom the Software is
+#   furnished to do so, subject to the following conditions:
+#
+#   The above copyright notice and this permission notice shall be included in
+#   all copies or substantial portions of the Software.
+#
+#   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+#   THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+#   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+#   DEALINGS IN THE SOFTWARE.
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+use Data::Dumper;
+use warnings FATAL => 'numeric';
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose}     = 1;
+    $$self{config_version} = '1671797378';
+    $$self{embed_d3} = 1;
+    $$self{compress} = 1;
+    $$self{d3_url}   = 'https://d3js.org/d3.v7.min.js';
+    $$self{pako_url} = 'https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.4/pako.min.js';
+
+    $$self{sort_by}  = 'DNM';
+
+    $$self{missing} = { SCBZ=>0 };
+    $$self{prefilter} = '$DNM>-5 && $VCF_QUAL>35 && $nReads_proband>=10 && $nReads_mother>=10 && ($nReads_father>=10 || $inheritance eq "m")';
+    $$self{expr_snv}  = [ '$DNM>-5 && $DNG>-5 && $NPS<{50,70,100,200}' ];
+    $$self{expr_ins}  = [ '$DNM>-5 && $DNG>-5 && $NPS<{50,70,100,200}' ];
+    $$self{expr_del}  = [ '$DNM>-5 && $DNG>-5 && $NPS<{50,70,100,200}' ];
+
+    $$self{mrate_snv} = 4.5e-8;
+    $$self{mrate_del} = 4.5e-8 * 0.11 * 0.7;  # not quite sure about these numbers
+    $$self{mrate_ins} = 4.5e-8 * 0.11 * 0.3;
+    $$self{exp_syn}   = '0.160734*2';
+    $$self{exp_mis}   = '0.364192*2';
+    $$self{exp_lof}   = '0.0277504*2';
+    $$self{exp_stop}  = '0.0181173*2';
+
+    $$self{trim} = 0.05;
+
+    $$self{_sampleconf} = q[
+        version  => '] .$$self{config_version}. q[',
+        verbose  => 1,
+
+        compress => ]. $$self{compress}  .q[,    # Compress data inside the resulting html file
+        embed_d3 => ]. $$self{embed_d3}  .q[,    # Embed js libraries for offline work, the output html will be 318K bigger
+        d3_url   => ']. $$self{d3_url}   .q[',   # URL of the d3 library
+        pako_url => ']. $$self{pako_url} .q[',   # URL of the pako (data decompression) library
+
+
+        # Estimated mutation rate, this is to show observed vs expected callset size
+        mrate_snv => ]. $$self{mrate_snv} .q[,
+        mrate_del => ]. $$self{mrate_del} .q[,  # not sure about these numbers, awaiting approx 11% of the SNVs, 70% deletions
+        mrate_ins => ]. $$self{mrate_ins} .q[,  # not sure about these numbers
+
+        # Expected number of synonymous, missense, LoF, and stop variants per sample,
+        # here simplifying to flat rates across the genome, counting both parental copies,
+        # and not account for chrX,Y in males vs females
+        exp_syn  => ]. $$self{exp_syn}  .q[,
+        exp_mis  => ]. $$self{exp_mis}  .q[,
+        exp_lof  => ]. $$self{exp_lof}  .q[,
+        exp_stop => ]. $$self{exp_stop} .q[,
+
+        # bp resolution map of expected stopgain,missense,synonymous,lof rates formatted as
+        #   gene_symbol     ensembl_ID      Chrom   Pos     Ref     Alt     roulette_mut_rate       UKBBadj_mut_rate        annotation
+        #   OR4F5           ENSG00000186092 1       65434   G       A       0.186                   7.54432692307692e-09    lof
+        exp_rates => undef,
+
+        # Target regions in case the callset contains calls from outside the regions (often padding is added
+        # to bait regions in exome sequencing).
+        # If given, the O/E size, syn, mis, lof, stop numbers are computed with respect to the target regions.
+        # If not given, the entire callset is considered and the numbers are computed with respect to the accessible
+        # genome size (gsize)
+        targets  => undef,
+
+        # A single value (string) or multiple keys (as an array) can be given
+        sort_by  => ']. $$self{sort_by} .q[',
+
+        # Substitute missing values (".")
+        missing => { SCBZ=>0 },
+
+        # Filtering expressions
+        prefilter => ']. $$self{prefilter} .q[',
+        expr_snv => \[ ']. $$self{expr_snv}[0] .q[' \],
+        expr_ins => \[ ']. $$self{expr_ins}[0] .q[' \],
+        expr_del => \[ ']. $$self{expr_del}[0] .q[' \],
+
+        # The input format is the annotated.sites.txt.gz output of run-trio-dnm pipeline, e.g.
+        #   #[1]chr [2]pos  [3]ref  [4]alt  [5]proband   [6]father  [7]mother  [8]nReads_proband ...
+        #   chr1    10383   A       C       EGAN000001   EGAN00002  EGAN00000  3    ....
+        #   ...
+        #
+        # The expression above can be overriden for individual sets
+        #   sets  =>
+        #   [
+        #       {
+        #           name  => 'alspac',
+        #           src   => '/path/to/tab-delimited-annotated-file.txt.gz',
+        #           nsmpl => 1326,      # number of samples (trios)
+        #           gsize => 36.7427,   # size of accessible genome, in Mbp
+        #       },
+        #   ],
+
+    ]."\n";
+
+    $$self{usage} .=
+        "About: This script creates an interactive HTML file which allows to filter and explore\n" .
+        "       a DNM callset\n" .
+        "Usage: run-filtering\n" .
+        "Options:\n" .
+        "   -c  --compress 0|1          Compress the embedded data [$$self{compress}]\n" .
+        "   -e  --embed-d3 0|1          Embed the JS d3 library within the generated HTML files [$$self{embed_d3}]\n" .
+        "   -f, --filter STR,INT,FLT    Create a filtered set; STR=label, INT=expression ID, FLT=threshold\n" .
+        "   -o, --outdir DIR            Output directory\n" .
+        "   -t, --trim-display FLT      Trim data points to prevent small-sample size fluctuations [0.05]\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-f' or $arg eq '--filter' ) { $$self{filter}=shift(@ARGV); next; }
+        if ( $arg eq '-e' or $arg eq '--embed-d3' ) { $$self{embed_d3}=shift(@ARGV); next; }
+        if ( $arg eq '-c' or $arg eq '--compress' ) { $$self{compress}=shift(@ARGV); next; }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        if ( $arg eq '-t' or $arg eq '--trim-display' ) { $$self{trim}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    $$self{outdir} =~ s{/+$}{};
+    $self->save_config("run-filtering.conf");
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+
+    $self->cmd("mkdir -p $$self{outdir}/raw");
+    $self->cmd("mkdir -p $$self{outdir}/preflt");
+    $self->cmd("mkdir -p $$self{outdir}/flt");
+    $self->cmd("mkdir -p $$self{outdir}/done");
+
+    $self->init_exp_rates;
+
+    for my $set (@{$$self{sets}})
+    {
+        $self->set_init($set);
+        $self->spawn('filter_set',"$$self{outdir}/done/filter.$$set{name}",$set);
+    }
+    $self->wait;
+
+    if ( exists($$self{filter}) )
+    {
+        my ($lbl,$expr,$th) = split(/,/,$$self{filter});
+        $self->spawn('filter_at',"$$self{outdir}/$lbl.$expr.$th.txt.gz");
+        $self->wait;
+        $self->all_done;
+    }
+
+    for my $set (@{$$self{sets}})
+    {
+        $self->set_init($set);
+        $self->spawn('plot_set',"$$self{outdir}/done/plot.$$set{name}",$set);
+    }
+    $self->wait;
+
+    $self->all_done;
+}
+
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub run_cmd
+{
+    my ($self,$outfile,$cmd) = @_;
+    $self->cmd($cmd);
+    `touch $outfile`;
+}
+
+sub col_names
+{
+    my ($self,$file,@names) = @_;
+    my $hdr;
+    if ( ref($file) eq 'HASH' )
+    {
+        if ( exists($$file{hdr}) ) { $hdr = $$file{hdr}; }
+        else { $self->throw("Incorrect usage\n"); }
+    }
+    if ( !defined $hdr ) { $hdr = (`zless $file | head -1`)[0]; }
+    if ( !defined $hdr ) { $self->throw("The file has no header: $file"); }
+    my @cols = split(/\t/,$hdr);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    if ( @names )
+    {
+        my @out = ();
+        for my $name (@names)
+        {
+            if ( !exists($cols{$name}) ) { $self->throw("No such column in $file: $name\n"); }
+            push @out,$cols{$name};
+        }
+        return (\%cols,@out);
+    }
+    return \%cols;
+}
+
+# todo: each set can have different target regions
+sub init_exp_rates
+{
+    my ($self) = @_;
+    if ( !defined($$self{targets}) or !defined($$self{exp_rates}) ) { return }
+
+    my $fname = "$$self{outdir}/exp-rates.txt";
+    $self->spawn('run_cmd',$fname,qq[
+        zcat $$self{exp_rates} | tail -n +2 | awk -F \\\\t '{OFS="\\t"}{\$3="chr"\$3; print \$line}' |
+        annot-tsv -s $$self{targets} -c 1,2,3:3,4,4 -f tgt |
+        awk -F \\\\t '{if(\$10=="tgt")s[\$9]+=\$8}END{for (x in s) print x,s[x]}' > $fname.part &&
+        mv $fname.part $fname
+    ]);
+    $self->wait;
+
+    # stopgain 0.0096967
+    # missense 0.17712
+    # synonymous 0.072613
+    # lof 0.00505313
+    for my $line ($self->cmd(qq[cat $fname]))
+    {
+        chomp($line);
+        my ($type,$rate) = split(/\s+/,$line);
+        if ( $type eq 'missense' ) { $$self{exp_mis} = 2*$rate; }
+        if ( $type eq 'synonymous' ) { $$self{exp_syn} = 2*$rate; }
+        if ( $type eq 'stopgain' ) { $$self{exp_stop} = 2*$rate; }
+        if ( $type eq 'lof' ) { $$self{exp_lof} = 2*$rate; }
+    }
+    $$self{exp_lof} += $$self{exp_stop};
+}
+
+# Each $set hash looks in the end something like this:
+#   {
+#         'src' => '/path/to/out.trio-dnm/annotated.sites.txt.gz',
+#         'raw' => 'out.2025-01-14/raw/alspac.txt.gz',
+#         'readme' => 'out.2025-01-14/flt/README.alspac.txt',
+#         'plots' => 'out.2025-01-14/plots/alspac',
+#         'preflt' => 'out.2025-01-14/preflt/alspac.txt.gz',
+#         'flt' => 'out.2025-01-14/flt/alspac.txt.gz',
+#         'name' => 'alspac',
+#         'func_ins' => [
+#                             {
+#                               'type' => 'ins',
+#                               'str' => '$DNM>-5 && $DNG>-5 && $NPS<50',
+#                               'vaf_by_qual' => 'out.2025-01-14/plots/bib/vaf-by-qual.4.ins.txt.gz',
+#                               'html' => '$DNM>-5 && $DNG>{<span class="part x1_17" id="x1_17">-5</span>,<span class="part x1_20" id="x1_20">-1</span>} && ...',
+#                               'class' => ' x1_17 x1_33',
+#                               'ifunc' => '4'
+#                             },
+#                             {
+#                               'type' => 'ins',
+#                               'str' => '$DNM>-4 && $NPS<200',
+#                               'ifunc' => 1,
+#                               ...
+#                             }
+#                           ],
+#         'func_snv' => [ .. ],
+#         'func_del' => [ .. ],
+#         'func2filter' => {
+#                            '0' => $VAR1->{'func_snv'}[0],
+#                            '1' => $VAR1->{'func_snv'}[1],
+#                            '3' => $VAR1->{'func_ins'}[1],
+#                            '2' => $VAR1->{'func_ins'}[0],
+#                            '4' => $VAR1->{'func_del'}[0],
+#                            '5' => $VAR1->{'func_del'}[1]
+#                          }
+#   }
+sub set_init
+{
+    my ($self,$set) = @_;
+    $$set{raw}    = "$$self{outdir}/raw/$$set{name}.txt.gz";
+    $$set{preflt} = "$$self{outdir}/preflt/$$set{name}.txt.gz";
+    $$set{flt}    = "$$self{outdir}/flt/$$set{name}.txt.gz";
+    $$set{readme} = "$$self{outdir}/flt/README.$$set{name}.txt";
+    $$set{plots}  = "$$self{outdir}/plots/$$set{name}";
+    if ( exists($$self{prefilter}) && !exists($$set{prefilter}) ) { $$set{prefilter} = $$self{prefilter}; }
+    if ( !exists($$set{sort_by}) ) { $$set{sort_by} = $$self{sort_by}; }
+    if ( !exists($$set{missing}) ) { $$set{missing} = $$self{missing}; }
+    if ( !exists($$set{targets}) ) { $$set{targets} = $$self{targets}; }
+    if ( !exists($$set{gsize}) ) { $$set{gsize} = $$self{gsize}; }
+    if ( $self->is_finished($$set{readme}) )
+    {
+        for my $line (`cat $$set{readme}`)
+        {
+            if ( $line=~/^#/ ) { next; }
+            chomp($line);
+            my ($ifunc,$type,$expr,$class,$html) = split(/\t/,$line);
+            if ( $$set{init_done}{$ifunc} ) { next; }
+            $$set{init_done}{$ifunc} = 1;
+            my $filter = { ifunc=>$ifunc, type=>$type, str=>$expr, class=>$class, html=>$html };
+            push @{$$set{"func_$type"}},$filter;
+            $$set{func2filter}{$ifunc} = $filter;
+        }
+    }
+}
+sub func_init
+{
+    my ($self,$hdr,$expr) = @_;
+    my $str = $expr;
+    my $tmp;
+    while ( $str =~/\$(\w+)/ )
+    {
+        $str = $';
+        my $var = $1;
+        if ( !exists($$hdr{$var}) ) { $self->throw("Error: no such column '$var'\n"); }
+        $tmp .= $` ."\$col[$$hdr{$var}]";
+    }
+    $tmp .= $str;
+
+    my $func;
+    my $ok = 0;
+    eval '
+        $func = sub
+        {
+            my (@col) = @_;
+            if ( '. $tmp .' ) { return 1; }
+            return 0;
+        };
+        $ok = 1;
+    ';
+    if ( !$ok or !defined $func ) { $self->throw("Could not compile the expression: $tmp\n"); }
+    return ($func,$tmp);
+}
+sub replace_missing
+{
+    my ($self,$set,$src,$dst) = @_;
+    if ( !exists($$set{missing}) )
+    {
+        $self->cmd("cp $src $dst.part && mv $dst.part $dst");
+        return;
+    }
+    my $hdr = $self->col_names($src);
+    open(my $in,"gunzip -c $src |") or $self->throw("gunzip -c $src: $!");
+    open(my $fh,"| gzip -c > $dst.part") or $self->throw("gzip -c > $dst.part: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { print $fh $line; next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        for my $key (keys %{$$set{missing}})
+        {
+            if ( !exists($$hdr{$key}) ) { next; }
+            my $i = $$hdr{$key};
+            if ( $col[$i] eq '.' ) { $col[$i] = $$set{missing}{$key}; }
+        }
+        print $fh join("\t",@col)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $src");
+    close($fh) or $self->throw("close failed: gzip -c > $dst.part");
+    rename("$dst.part",$dst) or $self->throw("rename $dst.part $dst: $!");
+}
+sub filter_set
+{
+    my ($self,$outfile,$set) = @_;
+    if ( !$self->is_finished($$set{raw}) )
+    {
+        $self->replace_missing($set,$$set{src},$$set{raw});
+    }
+    if ( !$self->is_finished($$set{preflt}) )
+    {
+        print STDERR ".. pre-filtering $$set{raw} >>> $$set{preflt}\n";
+        my $tmp = "$$set{preflt}.part";
+        my $hdr = $self->col_names($$set{raw});
+        my $hdr_line;
+        my ($func,undef) = $self->func_init($hdr,$$set{prefilter});
+        open(my $in,"zless $$set{raw} |") or $self->throw("zless $$set{raw}: $!");
+        open(my $fh,"| gzip -c > $tmp") or $self->throw("gzip -c > $tmp: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^#/ )
+            {
+                if ( !defined $hdr_line )
+                {
+                    chomp($line);
+                    $hdr_line = $line;
+                }
+                next;
+            }
+            my @col = split(/\t/,$line);
+            chomp($col[-1]);
+            if ( !&$func(@col) ) { next; }
+            print $fh $line;
+        }
+        close($in) or $self->throw("close failed: zless $$set{preflt}");
+        close($fh) or $self->throw("close failed: gzip -c > $tmp");
+
+        my @keys = ref($$self{sort_by}) eq 'ARRAY' ? @{$$self{sort_by}} : ($$self{sort_by});
+        my $sort;
+        for my $key (@keys)
+        {
+            if ( !exists($$hdr{$key}) ) { $self->throw("No such key \"$key\" in $$set{raw}"); }
+            my $i = $$hdr{$key} + 1;
+            $sort .= " -k$i,${i}g";
+        }
+        my $cmd = "zless $tmp | sort $sort";
+        print STDERR "$cmd\n";
+        open($in,"$cmd |") or $self->throw("$cmd: $!");
+        open($fh,"| gzip -c > $$set{preflt}") or $self->throw("gzip -c > $$set{preflt}: $!");
+        print $fh $hdr_line."\trank\tsort_by\n";
+        my $rank = 1;
+        my $prev;
+        while (my $line=<$in>)
+        {
+            chomp($line);
+            my @col = split(/\t/,$line);
+            my @val;
+            for my $key (@keys) { push @val,$col[$$hdr{$key}]; }
+            my $val = join(';',@val);
+            if ( defined $prev && $prev ne $val ) { $rank++; }
+            print $fh $line."\t$rank\t$val\n";
+            $prev = $val;
+        }
+        close($fh) or $self->throw("close failed: gzip -c > $$set{preflt}");
+        close($in) or $self->throw("close failed: $cmd");
+        unlink($tmp);
+    }
+
+    my $hdr = $self->col_names($$set{preflt});
+    $self->filter_init($set,$hdr);
+    print STDERR ".. filtering $$set{preflt} >>> $$set{flt}\n";
+    open(my $in,"zless $$set{preflt} |") or $self->throw("zless $$set{preflt}: $!");
+    open(my $fh,"| gzip -c > $$set{flt}") or $self->throw("gzip -c > $$set{flt}: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $line=~/^#/ )
+        {
+            print $fh join("\t",@col,sprintf('[%d]pass',1 + scalar @col))."\n";
+            next;
+        }
+        my $pass = $self->filter_site($set,$hdr,\@col);
+        print $fh join("\t",@col,$pass)."\n";
+    }
+    close($in) or $self->throw("close failed: zless $$set{preflt}");
+    close($fh) or $self->throw("close failed: gzip -c > $$set{flt}");
+
+    if ( defined($$set{targets}) )
+    {
+        $self->cmd(qq[annot-tsv -s $$set{targets} -t $$set{flt} -c 1,2,3:chr,pos,pos -f tgt | gzip -c > $$set{flt}.tmp && mv $$set{flt}.tmp $$set{flt}]);
+    }
+
+    open($fh,'>',$$set{readme}) or $self->throw("$$set{readme}: $!");
+    print $fh "# The column pass contains the following filters:\n";
+    for my $ifunc (sort {$a<=>$b} keys %{$$set{func2filter}})
+    {
+        my $flt = $$set{func2filter}{$ifunc};
+        if ( !defined($$flt{class}) ) { $$flt{class} = ''; }    # this can happen when there is nothing to expand in the expression
+        print $fh join("\t",$ifunc,$$flt{type},$$flt{str},$$flt{class},$$flt{html})."\n";
+    }
+    close($fh) or $self->throw("close failed: $$set{readme}");
+    $self->cmd("touch $outfile");
+}
+sub filter_init
+{
+    my ($self,$set,$hdr) = @_;
+    delete($$set{func2filter});
+    for my $type (qw(snv ins del))
+    {
+        delete($$set{"func_$type"});
+        my $exp_type = "expr_$type";
+        my $expr_arr = exists($$set{$exp_type}) ? $$set{$exp_type} : (exists($$self{$exp_type})? $$self{$exp_type} : undef);
+        if ( !defined $expr_arr ) { next; }
+
+        # expand all expressions
+        my @jobs;
+        for my $expr (@$expr_arr)
+        {
+            push @jobs,($self->filter_expand($set,$type,$hdr,$expr));
+        }
+        $$set{"func_$type"} = \@jobs;
+    }
+}
+sub filter_expand
+{
+    my ($self,$set,$type,$hdr,$expr_str) = @_;
+    my $iexpr = $$set{iexpr}++;
+
+    # Generate all possible expressions; ptr is a pointer to the original expression string, eg
+    # the string
+    #       $DNM>-5 && $DNG>{-5,-1} && $NPS<{50,200}
+    #                        ^17             ^33
+    # generates
+    #       $DNM>-5 && $DNG>-5 && $NPS<50       len=2,off=5,idx=17 and len=2,off=11,idx=33
+    #       $DNM>-5 && $DNG>-5 && $NPS<200
+    # where
+    #       len = is the length of the value (e.g. 2 for -5 and 50 above)
+    #       off = is the sum of the previous values in the curly brackets (e.g. 5 for {-5,-1})
+    #       idx = is the 0-based start of the value in the original string (e.g. 17 for "-5,-1}..." )
+    #
+    my @list = ({expr=>$expr_str, ptr=>[{len=>0, off=>0, idx=>0}]});
+    my $expand = 1;
+    my $id2cls = {};  # mutually exclusive classes in the expression display, cannot be switched on at the same time
+    while ( $expand )
+    {
+        $expand = 0;
+        for (my $i=0; $i<@list; $i++)
+        {
+            my $item = $list[$i];
+            if ( !($$item{expr}=~/\{([^}]+)\}/) ) { next; }
+            my $bef  = $`;
+            my $mat  = $1;
+            my $aft  = $';
+            my $off  = $$item{ptr}[-1]{off} + length($&);
+            my @vals = split(/,/,$mat);
+            my $len  = 1;
+            my $clid = scalar keys %$id2cls;
+            for (my $j=0; $j<@vals; $j++)
+            {
+                my $val = $vals[$j];
+                my @ptr = @{$$item{ptr}};
+                my $idx = $ptr[-1]{off} + length($bef) + $len;
+                my $id    = "x${iexpr}_$idx";
+                if ( !exists($$id2cls{$id}) ) { $$id2cls{$id} = $clid; }
+                push @ptr, { len=>length($val), off=>$off - length($val), idx=>$idx };
+                push @list,{ expr=>$bef.$val.$aft, ptr=>\@ptr };
+                $len += length($val) + 1;
+            }
+            splice(@list,$i,1);
+            $i--;
+            $expand = 1;
+        }
+    }
+
+    # Mapping between between each item in the curly brackets (e.g. -5 in {-5,-1} and its length)
+    my $idx2len = {};
+    for my $item (@list)
+    {
+        for my $ptr (@{$$item{ptr}})
+        {
+            my $idx = $$ptr{idx};
+            if ( $idx == 0 ) { next; }
+            $$idx2len{$idx} = $$ptr{len};
+            $$item{class} .= " x${iexpr}_$idx";
+        }
+    }
+
+    # For each expression create a function which will parse it efficiently and an html markup
+    my @out = ();
+    for my $expr (@list)
+    {
+        my $ori = $$expr{expr};
+        my ($func,$tmp) = $self->func_init($hdr,$$expr{expr});
+        my $ifunc  = scalar keys %{$$set{func2filter}};
+        my $filter = { type=>$type, str=>$ori, expr=>$tmp, func=>$func, ifunc=>$ifunc, class=>$$expr{class} };
+        push @out,$filter;
+        $$set{func2filter}{$ifunc} = $filter;
+    }
+
+    my $html;
+    my $ibeg = 0;
+    for my $idx (sort {$a<=>$b} keys %$idx2len)
+    {
+        my $html_id = "x${iexpr}_$idx";
+        my $len = $$idx2len{$idx};
+        $html .= substr($expr_str,$ibeg,$idx-$ibeg);
+        $html .= '<span id="'.$html_id.'" class="part '.$html_id.'">'.substr($expr_str,$idx,$len).'</span>';
+        $ibeg  = $idx + $len;
+    }
+    if ( $ibeg < length($expr_str) ) { $html .= substr($expr_str,$ibeg); }
+
+    $html =~ s/\n\s*/ /g;
+    for my $out (@out) { $$out{html} = $html; }
+    return (@out);
+}
+sub filter_site
+{
+    my ($self,$set,$hdr,$col) = @_;
+    my $ilen = $$hdr{indel_length};
+    if ( !defined $ilen ) { $self->throw("No indel_length column; todo: check for ref/alt"); }
+    my $type = $$col[$ilen]==0 ? 'snv' : ($$col[$ilen]<0 ? 'del' : 'ins');
+    $type = "func_$type";
+    if ( !exists($$set{$type}) ) { return '.'; }
+    my @pass = ();
+    for my $expr (@{$$set{$type}})
+    {
+        my $func = $$expr{func};
+        if ( &$func(@$col) ) { push @pass,$$expr{ifunc}; }
+    }
+    return @pass ? join(',',@pass) : '.';
+}
+
+sub calc_vaf_by_qual
+{
+    my ($self,$outfile,$set,$flt) = @_;
+    if ( $self->is_finished($outfile) ) { return; }
+    my $hdr = $self->col_names($$set{flt});
+    my $iqual = $$hdr{rank};
+    my $ivaf  = $$hdr{VAF};
+    my $ipass = $$hdr{pass};
+    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $fh join("\t",qw(qual nvaf25 size vaf25))."\n";
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    my $cmd = qq[stats q -c qs | awk '{OFS="\\t"}{if (\$3!=0) print \$line,\$2*100./\$3}' | gzip -c >> $outfile.part];
+    print STDERR "$cmd\n";
+    open($fh,"| $cmd") or $self->throw("$cmd: $!");
+    open(my $in,"gunzip -c $$set{flt} |") or $self->throw("gunzip -c $$set{flt}: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $pass = $col[$ipass];
+        if ( $pass eq '.' ) { next; }
+        my $is_pass = 0;
+        for my $x (split(/,/,$pass))
+        {
+            if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
+        }
+        if ( !$is_pass ) { next; }
+        my $is_vaf25 = $col[$ivaf] < 25 ? 1  :0;
+        print $fh join("\t",$col[$iqual],$is_vaf25)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
+    close($fh) or $self->throw("close failed: $cmd");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub calc_dup_by_qual
+{
+    my ($self,$outfile,$set,$flt) = @_;
+    if ( $self->is_finished($outfile) ) { return; }
+    my $hdr = $self->col_names($$set{flt});
+    my $iqual = $$hdr{rank};
+    my $ichr  = $$hdr{chr} + 1;
+    my $ipos  = $$hdr{pos} + 1;
+    my $ipass = $$hdr{pass};
+    my $cmd = "gunzip -c $$set{flt} | sort -k$ichr,${ichr}d -k$ipos,${ipos}n";
+    print STDERR "$cmd\n";
+    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    open(my $in,"$cmd |") or $self->throw("$cmd: $!");
+    my @buf = ();
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        chomp($line);
+        my (@col) = split(/\t/,$line);
+        my $chr  = $col[$ichr-1];
+        my $pos  = $col[$ipos-1];
+        my $qual = $col[$iqual];
+        my $pass = $col[$ipass];
+        push @buf,{key=>"$chr-$pos",is_dup=>0,line=>join("\t",$chr,$pos,$qual,$pass)};
+        if ( $buf[0]{key} eq $buf[-1]{key} ) { next; }
+        if ( @buf>2 )
+        {
+            for (my $i=0; $i<@buf-1; $i++) { $buf[$i]{is_dup} = 1; }
+        }
+        while ( @buf>1 )
+        {
+            my $x = shift(@buf);
+            print $fh join("\t",$$x{line},$$x{is_dup}?1:0)."\n";
+        }
+    }
+    if ( @buf>2 )
+    {
+        for (my $i=0; $i<@buf; $i++) { $buf[$i]{is_dup} = 1; }
+    }
+    while ( @buf )
+    {
+        my $x = shift(@buf);
+        print $fh join("\t",$$x{line},$$x{is_dup}?1:0)."\n";
+    }
+    close($in) or $self->throw("close failed: $cmd");
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+
+    open($fh,"| gzip -c > $outfile.partx") or $self->throw("gzip -c > $outfile.partx: $!");
+    print $fh join("\t",qw(qual ndup size dup))."\n";
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    $cmd = qq[stats q -c qs | awk '{OFS="\\t"}{if (\$3!=0) print \$line,\$2*100./\$3}' | gzip -c >> $outfile.partx];
+    print STDERR "$cmd\n";
+    open($fh,"| $cmd") or $self->throw("$cmd: $!");
+    open($in,"gunzip -c $outfile.part |") or $self->throw("gunzip -c $outfile.part: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+
+        # chr,pos,qual,pass,is_dup
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $pass = $col[3];
+        if ( $pass eq '.' ) { next; }
+        my $is_pass = 0;
+        for my $x (split(/,/,$pass))
+        {
+            if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
+        }
+        if ( !$is_pass ) { next; }
+        print $fh join("\t",$col[2],$col[4])."\n";  # prints qual,is_dup
+    }
+    close($in) or $self->throw("close failed: gunzip -c $outfile.part");
+    close($fh) or $self->throw("close failed: $cmd");
+    unlink("$outfile.part");
+    rename("$outfile.partx",$outfile) or $self->throw("rename $outfile.partx $outfile: $!");
+}
+sub calc_titv_by_qual
+{
+    my ($self,$outfile,$set,$flt) = @_;
+    if ( $self->is_finished($outfile) ) { return; }
+    my $hdr = $self->col_names($$set{flt});
+    my $iqual = $$hdr{rank};
+    my $ipass = $$hdr{pass};
+    my $iref  = $$hdr{ref};
+    my $ialt  = $$hdr{alt};
+    my %is_ti = ( AG=>1, GA=>1, CT=>1, TC=>1 );
+    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $fh join("\t",qw(qual nti ntv size titv))."\n";
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    my $cmd = qq[stats q -c qss | awk '{OFS="\\t"}{if(\$3>0)print \$line,\$2*1./\$3;else print \$line,0;}' | gzip -c >> $outfile.part];
+    print STDERR "$cmd\n";
+    open($fh,"| $cmd") or $self->throw("$cmd: $!");
+    open(my $in,"gunzip -c $$set{flt} |") or $self->throw("gunzip -c $$set{flt}: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $pass = $col[$ipass];
+        if ( $pass eq '.' ) { next; }
+        my $is_pass = 0;
+        for my $x (split(/,/,$pass))
+        {
+            if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
+        }
+        if ( !$is_pass ) { next; }
+        my $ref = $col[$iref];
+        my $alt = $col[$ialt];
+        if ( length($ref)!=1 or length($alt)!=1 ) { $self->throw("should not happen!"); }
+        my $titv = exists($is_ti{$ref.$alt}) ? "1\t0" : "0\t1";
+        print $fh join("\t",$col[$iqual],$titv)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
+    close($fh) or $self->throw("close failed: $cmd");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub ntp_tot
+{
+    my ($self,$file,$type) = @_;
+    if ( exists($$self{ntp_tot}{$file}{$type}) ) { return $$self{ntp_tot}{$file}{$type}; }
+    my $hdr = $self->col_names($file);
+    my $icurated = $$hdr{curated};
+    my $ntp = 0;
+    open(my $in,"gunzip -c $file |") or $self->throw("gunzip -c $file: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $col[$icurated] eq 'true' ) { $ntp++; }
+    }
+    close($in) or $self->throw("close failed: gunzip -c $file");
+    $$self{ntp_tot}{$file}{$type} = $ntp;
+    return $ntp;
+}
+sub calc_fdr_by_qual
+{
+    my ($self,$outfile,$set,$flt) = @_;
+    $$set{has_precision_recall} = 1;
+    if ( $self->is_finished($outfile) ) { return; }
+    my $hdr = $self->col_names($$set{flt});
+    if ( !exists($$hdr{curated}) ) { $$set{has_precision_recall} = 0; return; }
+    my $ntp_tot = $self->ntp_tot($$set{raw},$$flt{type});
+    my $iqual = $$hdr{rank};
+    my $ipass = $$hdr{pass};
+    my $icurated = $$hdr{curated};
+    my $cmd = qq[stats q -c qss | gzip -c > $outfile.part];
+    print STDERR "$cmd\n";
+    open(my $fh,"| $cmd") or $self->throw("$cmd: $!");
+    open(my $in,"gunzip -c $$set{flt} |") or $self->throw("gunzip -c $$set{flt}: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $pass = $col[$ipass];
+        if ( $pass eq '.' ) { next; }
+        my $is_pass = 0;
+        for my $x (split(/,/,$pass))
+        {
+            if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
+        }
+        if ( !$is_pass ) { next; }
+        my $is_tp = 0;
+        my $is_fp = 0;
+        if ( $col[$icurated] eq 'true' ) { $is_tp = 1; }
+        elsif ( $col[$icurated] eq 'false' ) { $is_fp = 1; }
+        print $fh join("\t",$col[$iqual],$is_tp,$is_fp)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
+    close($fh) or $self->throw("close failed: $cmd");
+
+    open($fh,"| gzip -c > $outfile.partx") or $self->throw("gzip -c > $outfile.partx: $!");
+    open($in,"gunzip -c $outfile.part |") or $self->throw("gunzip -c $outfile.part: $!");
+    print $fh join("\t",qw(qual ntp nfp size precision recall))."\n";
+    while (my $line=<$in>)
+    {
+        chomp($line);
+        my ($qual,$ntp,$nfp,$size) = split(/\t/,$line);
+        my $precision = sprintf("%.1f",$ntp+$nfp ? 100*$ntp/($ntp+$nfp) : 0);
+        my $recall = sprintf("%.1f",$ntp_tot ? 100*$ntp/$ntp_tot : 0);
+        print $fh join("\t",$qual,$ntp,$nfp,$size,$precision,$recall)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $outfile.part");
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.partx");
+    unlink("outfile.part");
+    rename("$outfile.partx",$outfile) or $self->throw("rename $outfile.partx $outfile: $!");
+}
+sub calc_tpr_by_qual
+{
+    my ($self,$outfile,$set,$flt) = @_;
+    $$set{has_precision_recall} = 1;
+    if ( $self->is_finished($outfile) ) { return; }
+    my $hdr = $self->col_names($$set{flt});
+    if ( !exists($$hdr{curated}) ) { $$set{has_precision_recall} = 0; return; }
+    my $ntp_tot = $self->ntp_tot($$set{raw},$$flt{type});
+    my $iqual = $$hdr{rank};
+    my $ipass = $$hdr{pass};
+    my $icurated = $$hdr{curated};
+    my $cmd = qq[stats q -c qss | gzip -c > $outfile.part];
+    print STDERR "$cmd\n";
+    open(my $fh,"| $cmd") or $self->throw("$cmd: $!");
+    open(my $in,"gunzip -c $$set{flt} |") or $self->throw("gunzip -c $$set{flt}: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $pass = $col[$ipass];
+        if ( $pass eq '.' ) { next; }
+        my $is_pass = 0;
+        for my $x (split(/,/,$pass))
+        {
+            if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
+        }
+        if ( !$is_pass ) { next; }
+        my $is_tp = 0;
+        my $is_fp = 0;
+        if ( $col[$icurated] eq 'true' ) { $is_tp = 1; }
+        elsif ( $col[$icurated] ne '.' && $col[$icurated] ne 'todo' && !($col[$icurated]=~/auto/) ) { $is_fp = 1; }
+        print $fh join("\t",$col[$iqual],$is_tp,$is_fp)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
+    close($fh) or $self->throw("close failed: $cmd");
+
+    open($fh,"| gzip -c > $outfile.partx") or $self->throw("gzip -c > $outfile.partx: $!");
+    open($in,"gunzip -c $outfile.part |") or $self->throw("gunzip -c $outfile.part: $!");
+    print $fh join("\t",qw(qual ntp nfp size tpr))."\n";
+    while (my $line=<$in>)
+    {
+        chomp($line);
+        my ($qual,$ntp,$nfp,$size) = split(/\t/,$line);
+        my $tpr = sprintf("%.1f",$ntp+$nfp ? 100*$ntp/($ntp+$nfp) : 100);
+        print $fh join("\t",$qual,$ntp,$nfp,$size,$tpr)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $outfile.part");
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.partx");
+    unlink("outfile.part");
+    rename("$outfile.partx",$outfile) or $self->throw("rename $outfile.partx $outfile: $!");
+}
+
+sub csq_is_stop_gained
+{
+    my ($csq) = @_;
+    if ( $csq=~/nmd/ ) { return 0; }
+    if ( $csq=~/stop_gained/ ) { return 1; }
+    return 0;
+}
+sub csq_is_syn
+{
+    my ($csq) = @_;
+    if ( $csq=~/nmd/ ) { return 0; }
+    if ( $csq=~/synonymous/ or $csq=~/retained/ ) { return 1; }
+    return 0;
+}
+sub csq_is_mis
+{
+    my ($csq) = @_;
+    if ( $csq=~/nmd/ ) { return 0; }
+    if ( $csq=~/missense/ ) { return 1; }
+    return 0;
+}
+sub csq_is_lof
+{
+    my ($csq) = @_;
+    if ( $csq=~/nmd/ ) { return 0; }
+    if ( $csq=~/5th_base/ or $csq=~/donor_region/ or $csq=~/acceptor_region/ ) { return 0; }
+    if ( $csq=~/splice_acceptor/ or $csq=~/splice_donor/ ) { return 1; }
+    if ( $csq=~/stop_gained/ or $csq=~/stop_lost/ or $csq=~/start_lost/ ) { return 1; }
+    return 0;
+}
+sub csq_is_inframe
+{
+    my ($csq) = @_;
+    if ( $csq=~/nmd/ ) { return 0; }
+    if ( $csq=~/inframe/ ) { return 1; }
+    return 0;
+}
+sub csq_is_frameshift
+{
+    my ($csq) = @_;
+    if ( $csq=~/nmd/ ) { return 0; }
+    if ( $csq=~/frameshift/ ) { return 1; }
+    return 0;
+}
+sub calc_csq_by_qual_snv
+{
+    my ($self,$outfile,$set,$flt) = @_;
+    if ( $self->is_finished($outfile) ) { return; }
+    my $hdr = $self->col_names($$set{flt});
+    my $ichr  = $$hdr{chr};
+    my $iqual = $$hdr{rank};
+    my $ipass = $$hdr{pass};
+    my $icsq  = $$hdr{csq};
+    my $itgt  = $$hdr{tgt};
+    my $esyn  = $$set{nsmpl}*$$self{exp_syn};
+    my $emis  = $$set{nsmpl}*$$self{exp_mis};
+    my $elof  = $$set{nsmpl}*$$self{exp_lof};
+    my $estop = $$set{nsmpl}*$$self{exp_stop};
+    my $cmd = qq[stats q -c qss | gzip -c > $outfile.part];
+    print STDERR "$cmd\n";
+    open(my $fh,"| $cmd") or $self->throw("$cmd: $!");
+    open(my $in,"gunzip -c $$set{flt} |") or $self->throw("gunzip -c $$set{flt}: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $pass = $col[$ipass];
+        if ( $pass eq '.' ) { next; }
+        my $is_pass = 0;
+        for my $x (split(/,/,$pass))
+        {
+            if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
+        }
+        if ( !$is_pass ) { next; }
+        my $do_csq = (!defined($$self{exclude_chr}) or !($col[$ichr]=~$$self{exclude_chr})) ? 1 : 0;
+        my $csq  = $col[$icsq];
+        my @type = (0,0); #,0,0);       # for now leaving out lof and stops
+        if ( $do_csq && (!defined $itgt or $col[$itgt] eq 'tgt') )
+        {
+            if ( csq_is_syn($csq) ) { $type[0] = 1; }
+            elsif ( csq_is_mis($csq) ) { $type[1] = 1; }
+            #elsif ( csq_is_lof($csq) ) { $type[2] = 1; }
+            #if ( csq_is_stop_gained($csq) ) {$type[3] = 1; }
+        }
+        print $fh join("\t",$col[$iqual],@type)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
+    close($fh) or $self->throw("close failed: $cmd");
+
+    open($fh,'>',"$outfile.r") or $self->throw("$outfile.r: $!");
+    print $fh qq[
+
+        # read the data in: qual,nsyn,nmis,size
+        x <- read.csv("$outfile.part",sep="\\t",header=FALSE)
+        results <- data.frame(
+            qual    = numeric(),
+            oe_syn  = numeric(),
+            lo_syn  = numeric(),
+            hi_syn  = numeric(),
+            oe_mis  = numeric(),
+            lo_mis  = numeric(),
+            hi_mis  = numeric(),
+            size    = numeric())
+
+        for (i in 1:nrow(x))
+        {
+            ci1  <- poisson.test(x[i,2],$esyn)\$conf.int
+            ci2  <- poisson.test(x[i,3],$emis)\$conf.int
+            results[i, ] <- c(x[i,1],x[i,2]/$esyn,min(ci1),max(ci1),x[i,3]/$emis,min(ci2),max(ci2),x[i,4])
+        }
+        write.table(results, gzfile("$outfile.partx"), quote=FALSE, row.names=FALSE, sep="\\t")
+    ];
+    close($fh) or $self->throw("close failed: $outfile.r");
+    $self->cmd(qq[Rscript $outfile.r]);
+    rename("$outfile.partx",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+    unlink("$outfile.part");
+}
+sub calc_csq_by_qual_indel
+{
+    my ($self,$outfile,$set,$flt) = @_;
+    if ( $self->is_finished($outfile) ) { return; }
+    my $hdr = $self->col_names($$set{flt});
+    my $iqual = $$hdr{rank};
+    my $ipass = $$hdr{pass};
+    my $icsq  = $$hdr{csq};
+    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $fh join("\t",qw(qual frm size))."\n";
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    my $cmd = qq[stats q -c qss | awk '{OFS="\\t"}{print \$1,(\$2+\$3)?100.*\$3/(\$2+\$3):0,\$4}' | gzip -c >> $outfile.part];   # fraction of frameshifts [%]
+    print STDERR "$cmd\n";
+    open($fh,"| $cmd") or $self->throw("$cmd: $!");
+    open(my $in,"gunzip -c $$set{flt} |") or $self->throw("gunzip -c $$set{flt}: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $pass = $col[$ipass];
+        if ( $pass eq '.' ) { next; }
+        my $is_pass = 0;
+        for my $x (split(/,/,$pass))
+        {
+            if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
+        }
+        if ( !$is_pass ) { next; }
+        my $csq  = $col[$icsq];
+        my @type = (0,0);
+        if ( csq_is_inframe($csq) ) { $type[0] = 1; }
+        elsif ( csq_is_frameshift($csq) ) { $type[1] = 1; }
+        print $fh join("\t",$col[$iqual],@type)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
+    close($fh) or $self->throw("close failed: $cmd");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub calc_oesize_by_qual
+{
+    my ($self,$outfile,$set,$flt) = @_;
+    if ( $self->is_finished($outfile) ) { return; }
+    my $hdr = $self->col_names($$set{flt});
+    my $iqual = $$hdr{rank};
+    my $itgt  = $$hdr{tgt};
+    my $ipass = $$hdr{pass};
+    if ( !defined($itgt) ) { return; }
+    my $gsize = (grep {chomp} $self->cmd(qq[zcat $$set{targets} | awk '{s+=\$3-\$2+1}END{print s/1e6}']))[0];
+    if ( $gsize ne $$set{gsize} ) { $self->warn("\nWarning: gsize is different in $$self{targets}: targets=$gsize vs gsize=$$set{gsize}\n\n"); }
+    my $nexp = $$set{nsmpl} * $gsize * 1e6 * $$self{"mrate_$$flt{type}"};
+    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $fh join("\t",qw(qual oesize))."\n";
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    my $cmd = qq[stats q -c qs | awk '{OFS="\\t"}{print \$1,\$2/$nexp}' | gzip -c >> $outfile.part];
+    print STDERR "$cmd\n";
+    open($fh,"| $cmd") or $self->throw("$cmd: $!");
+    open(my $in,"gunzip -c $$set{flt} |") or $self->throw("gunzip -c $$set{flt}: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $pass = $col[$ipass];
+        if ( $pass eq '.' ) { next; }
+        my $is_pass = 0;
+        for my $x (split(/,/,$pass))
+        {
+            if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
+        }
+        if ( !$is_pass ) { next; }
+        my $is_tgt = $col[$itgt] eq 'tgt' ? 1 : 0;
+        print $fh join("\t",$col[$iqual],$is_tgt)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
+    close($fh) or $self->throw("close failed: $cmd");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub create_rank2sort_by
+{
+    my ($self,$outfile,$set,$flt) = @_;
+    if ( $self->is_finished($outfile) ) { return; }
+    my $hdr = $self->col_names($$set{flt});
+    my $iqual = $$hdr{rank};
+    my $isort = $$hdr{sort_by};
+    my $ipass = $$hdr{pass};
+    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $fh join("\t",qw(qual sort_by))."\n";
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    my $cmd = qq[sort -k1,1gr | uniq | gzip -c >> $outfile.part];
+    print STDERR "$cmd\n";
+    open($fh,"| $cmd") or $self->throw("$cmd: $!");
+    open(my $in,"gunzip -c $$set{flt} |") or $self->throw("gunzip -c $$set{flt}: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $pass = $col[$ipass];
+        if ( $pass eq '.' ) { next; }
+        my $is_pass = 0;
+        for my $x (split(/,/,$pass))
+        {
+            if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
+        }
+        if ( !$is_pass ) { next; }
+        print $fh join("\t",$col[$iqual],$col[$isort])."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
+    close($fh) or $self->throw("close failed: $cmd");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+
+}
+sub plot_set
+{
+    my ($self,$outfile,$set) = @_;
+    my $dir = $$set{plots};
+    $self->cmd("mkdir -p $$set{plots}");
+
+    # All filtering functions are identified by its id and each filter selects
+    # just one variant type (snv,ins,del). Therefore, all the calc_ functions
+    # get just one of the variant types
+    for my $key (sort {$a<=>$b} keys %{$$set{func2filter}})
+    {
+        my $flt  = $$set{func2filter}{$key};
+        my $type = $$flt{type};
+        $$flt{rank2sort_by} = "$dir/rank2sort-by.$$flt{ifunc}.$type.txt.gz";
+        $self->create_rank2sort_by($$flt{rank2sort_by},$set,$flt);
+    }
+
+    for my $key (sort {$a<=>$b} keys %{$$set{func2filter}})
+    {
+        my $flt  = $$set{func2filter}{$key};
+        my $type = $$flt{type};
+        $$flt{oesize_by_qual} = "$dir/oesize-by-qual.$$flt{ifunc}.$type.txt.gz";
+        $self->calc_oesize_by_qual($$flt{oesize_by_qual},$set,$flt);
+    }
+
+    for my $key (sort {$a<=>$b} keys %{$$set{func2filter}})
+    {
+        my $flt  = $$set{func2filter}{$key};
+        my $type = $$flt{type};
+        $$flt{vaf_by_qual} = "$dir/vaf-by-qual.$$flt{ifunc}.$type.txt.gz";
+        $self->calc_vaf_by_qual($$flt{vaf_by_qual},$set,$flt);
+    }
+
+    for my $key (sort {$a<=>$b} keys %{$$set{func2filter}})
+    {
+        my $flt  = $$set{func2filter}{$key};
+        my $type = $$flt{type};
+        $$flt{dup_by_qual} = "$dir/dup-by-qual.$$flt{ifunc}.$type.txt.gz";
+        $self->calc_dup_by_qual($$flt{dup_by_qual},$set,$flt);
+    }
+
+    for my $key (sort {$a<=>$b} keys %{$$set{func2filter}})
+    {
+        my $flt  = $$set{func2filter}{$key};
+        if ( $$flt{type} ne 'snv' ) { next; }
+        $$flt{titv_by_qual} = "$dir/titv-by-qual.$$flt{ifunc}.txt.gz";
+        $self->calc_titv_by_qual($$flt{titv_by_qual},$set,$flt);
+    }
+
+    for my $key (sort {$a<=>$b} keys %{$$set{func2filter}})
+    {
+        my $flt  = $$set{func2filter}{$key};
+        $$flt{csq_by_qual} = "$dir/csq-by-qual.$$flt{ifunc}.txt.gz";
+        if ( $$flt{type} eq 'snv' )
+        {
+            $self->calc_csq_by_qual_snv($$flt{csq_by_qual},$set,$flt);
+        }
+        else
+        {
+            $self->calc_csq_by_qual_indel($$flt{csq_by_qual},$set,$flt);
+        }
+    }
+
+    for my $key (sort {$a<=>$b} keys %{$$set{func2filter}})
+    {
+        my $flt  = $$set{func2filter}{$key};
+        $$flt{fdr_by_qual} = "$dir/fdr-by-qual.$$flt{ifunc}.txt.gz";
+        $self->calc_fdr_by_qual($$flt{fdr_by_qual},$set,$flt);
+    }
+
+    for my $key (sort {$a<=>$b} keys %{$$set{func2filter}})
+    {
+        my $flt  = $$set{func2filter}{$key};
+        $$flt{tpr_by_qual} = "$dir/tpr-by-qual.$$flt{ifunc}.txt.gz";
+        $self->calc_tpr_by_qual($$flt{tpr_by_qual},$set,$flt);
+    }
+
+    $self->write_html($set,'snv');
+    $self->write_html($set,'ins');
+    $self->write_html($set,'del');
+}
+
+# Merge multiple data files by a shared column and output a csv-formatted array
+sub merge_data
+{
+    my ($self,$fnames,$cnames) = @_;
+    my @files;
+    for my $fname (@$fnames)
+    {
+        my $cmd = "gunzip -c $fname";
+        print STDERR "$cmd\n";
+        open(my $fh,"$cmd |") or $self->throw("$cmd: $!");
+        push @files, {cmd=>$cmd,fh=>$fh};
+    }
+    my @dat;
+    push @dat,join(",",@$cnames)."\n";
+    while (1)
+    {
+        my $done = 1;
+        my %out  = ();
+        for my $file (@files)
+        {
+            my $fh = $$file{fh};
+            my $line = <$fh>;
+            if ( !defined $line ) { next; }
+            $done = 0;
+            if ( !exists($$file{hdr}) )
+            {
+                $$file{hdr} = $self->col_names({hdr=>$line});
+                next;
+            }
+            my @col = split(/\t/,$line);
+            chomp($col[-1]);
+            for my $cname (@$cnames)
+            {
+                if ( !exists($$file{hdr}{$cname}) ) { next; }
+                my $val = $col[$$file{hdr}{$cname}];
+                if ( exists($out{$cname}) && $out{$cname} ne $val )
+                {
+                    $self->throw("The files are out of sync: $cname .. $out{$cname} vs $val\n\t".join("\n\t",@$fnames)."\n");
+                }
+                $out{$cname} = $val;
+            }
+        }
+        if ( $done ) { last; }
+        if ( !scalar %out ) { next; }   # first line only, the headers
+        my @out = ();
+        for my $cname (@$cnames)
+        {
+            if ( !exists($out{$cname}) ) { $self->throw("No column $cname in the files\n"); }
+            push @out,$out{$cname};
+        }
+        push @dat,join(",",@out)."\n";
+    }
+    for my $file (@files)
+    {
+        close($$file{fh}) or $self->throw("close failed: $$file{cmd}\n");
+    }
+    if ( $$self{trim} )
+    {
+        my $ntrim = $$self{trim}<1 ? int($$self{trim}*scalar @dat) : int($$self{trim});
+        my $hdr = shift(@dat);
+        my @x = splice(@dat,0,$ntrim);
+        unshift(@dat,$hdr);
+    }
+    return \@dat;
+}
+sub write_html
+{
+    my ($self,$set,$type) = @_;
+    # print STDERR Dumper($set);
+
+    # make this customizable via the runner config
+    my $width  = 600;
+    my $height = 300;
+    my $margin = 50;
+    my $color_normal = 'rgba(255,255,255,1)';       # white
+    my $color_click  = 'rgba(255,99,71,0.5)';       # tomato
+    my $color_hover  = 'rgba(255,165,0,0.5)';       # orange
+    my $color_click_hover = 'rgba(255,99,71,0.8)';  # tomato,darker
+    my $wd0 = 2;    # line width normal
+    my $wd1 = 3;    # line width hovered or selected
+    my $color0 = 'grey';
+    my $color1 = 'orange';
+    my $label  = defined($$set{label}) ? $$set{label} : $$set{name};
+    $label .= ", $$set{nsmpl} samples";
+    my $sort_by = ref($$self{sort_by}) eq 'ARRAY' ? join(';',@{$$self{sort_by}}) : $$self{sort_by};
+
+    my $d3js = qq[<script type="text/javascript" src="$$self{d3_url}"></script>];
+    my $pakojs = $$self{compress} ? qq[<script type="text/javascript" src="$$self{pako_url}"></script>] : '';
+    if ( $$self{embed_d3} )
+    {
+        $d3js = '<script type="text/javascript">'. $self->embed_js($$self{d3_url}) .'</script>';
+        $pakojs = $$self{compress} ? '<script type="text/javascript">'. $self->embed_js($$self{pako_url}) .'</script>' : '';
+    }
+
+    open(my $fh,'>',"$$set{plots}.$type.html") or $self->throw("$$set{plots}.$type.html");
+    print {$fh} << "EOT";
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>$label</title>
+<style>
+body {
+    margin: 10px 0 0 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    background-color: #f3f3f3;
+}
+#container {
+    padding: 20px;
+    background-color: white;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    box-sizing: border-box;
+}
+#id
+{
+    background-color:powderblue;
+}
+table {
+    margin-top:1em;
+}
+td {
+    padding: 0 3em 0 0;
+    white-space: nowrap;
+}
+td.data {
+    text-align: right;
+}
+td.qual {
+    text-align: left;
+}
+th {
+    text-align: left;
+    vertical-align: top;
+}
+.ofb {
+    /* value out of bounds */
+    color: grey;
+}
+.area
+{
+    opacity: 0.1;
+    fill: grey;
+}
+.area.hovered
+{
+    fill: $color_hover;
+    opacity: 0.3;
+}
+.line,
+.expr {
+    cursor:pointer;
+}
+.part {
+    cursor:pointer;
+    padding: 0.2em 0.4em 0.2em 0.4em;
+    border-radius:0.4em
+}
+.info-line.clicked
+{
+    stroke: $color_click_hover;
+}
+.line.hovered
+{
+    stroke: $color_hover;
+    stroke-width: $wd1;
+}
+.line.clicked
+{
+    stroke: $color_click;
+    stroke-width: $wd1;
+}
+.line.clicked.hovered
+{
+    stroke: $color_click_hover;
+    stroke-width: $wd1;
+}
+.part:hover,
+.hovered
+{
+    background-color: $color_hover;
+}
+.clicked
+{
+    background-color: $color_click;
+}
+.clicked.hovered
+{
+    background-color: $color_click_hover;
+}
+.clickable
+{
+    cursor: pointer;
+}
+.clickable:hover
+{
+    background-color: #eee;
+}
+.ci
+{
+    font-size: xx-small;
+    color: grey;
+}
+</style>
+    $d3js
+    $pakojs
+    <script type="text/javascript" defer>
+    let val_by_qual = [];
+EOT
+
+    my @html = ();
+    my %src  = ();
+    my $ftype = 'func_'.$type;
+    for my $flt (@{$$set{$ftype}})
+    {
+        if ( exists($src{$$flt{html}}) ) { next; }
+        $src{$$flt{html}} = 1;
+        push @html, "<br>".$$flt{html}."\n";
+    }
+    push @html,qq[<br><table><tr>
+        <th>Expression
+        <th>Size
+        <th class='clickable' onclick="val_by_becomes(obj,'oe_size')">O/E Size
+        <th class='clickable' onclick="val_by_becomes(obj,'vaf')">VAF25[%]
+        <th class='clickable' onclick="val_by_becomes(obj,'dup')">dup[%]
+        ].
+            ($type eq 'snv' ? qq[
+                <th class='clickable' onclick="val_by_becomes(obj,'titv')">ti/tv
+                <th class='clickable' onclick="val_by_becomes(obj,'oe_syn')">O/E syn
+                <th class='clickable' onclick="val_by_becomes(obj,'oe_mis')">O/E mis
+              ] : qq[
+                <th class='clickable' onclick="val_by_becomes(obj,'frm')">FrmShft[%]
+              ]
+            )
+        .
+            ($$set{has_precision_recall}
+            ? qq[
+                <th class='clickable' onclick="val_by_becomes(obj,'tpr')">TPR[%]
+            ] : '')
+        .qq[
+        <th>Rank:$sort_by
+    ];
+    for my $flt (@{$$set{$ftype}})
+    {
+        my $files = $type eq 'snv' ?
+            [$$flt{rank2sort_by},$$flt{oesize_by_qual},$$flt{vaf_by_qual},$$flt{dup_by_qual},$$flt{titv_by_qual},$$flt{csq_by_qual}] :
+            [$$flt{rank2sort_by},$$flt{oesize_by_qual},$$flt{vaf_by_qual},$$flt{dup_by_qual},$$flt{csq_by_qual}];
+        my $cols  = $type eq 'snv' ?
+            [qw(oesize qual sort_by size vaf25 dup titv oe_syn lo_syn hi_syn oe_mis lo_mis hi_mis)] :
+            [qw(oesize qual sort_by size vaf25 dup frm)];
+        if ( $$set{has_precision_recall} )
+        {
+            push @$files,$$flt{tpr_by_qual};
+            push @$cols,qw(tpr);
+        }
+        my $dat = $self->merge_data($files,$cols);
+        if ( $$self{compress} )
+        {
+            my $cmd = "gzip -c | base64 | tr -d \\\\n > $$set{plots}.html.rmme";
+            open(my $tmp,"| $cmd") or $self->throw("$cmd: $!");
+            print $tmp join('',@$dat);
+            close($tmp) or $self->throw("close failed: $cmd");
+            $dat = [`cat $$set{plots}.html.rmme`];
+            unlink("$$set{plots}.html.rmme");
+        }
+        print $fh "val_by_qual['$$flt{ifunc}']=`";
+        print $fh join('',@$dat);
+        print $fh "`;\n";
+
+        my $ifunc = $$flt{ifunc};
+        push @html,qq[<tr id="tr$ifunc" class="$$flt{class}">
+            <td><span id="expr$ifunc" name="expr$ifunc" class="expr $$flt{class}">(] .(1+$ifunc). qq[) $$flt{str}</span>
+            <td class="data"><span id="info_size_$$flt{ifunc}"></span>
+            <td class="data"><span id="info_oesize_$$flt{ifunc}"></span>
+            <td class="data"><span id="info_vaf_$$flt{ifunc}"></span>
+            <td class="data"><span id="info_dup_$$flt{ifunc}"></span>
+            ].
+                ($type eq 'snv' ?
+                    qq[
+                        <td class="data"><span id="info_titv_$$flt{ifunc}"></span>
+                        <td class="data"><span id="info_syn_$$flt{ifunc}"></span>
+                        <td class="data"><span id="info_mis_$$flt{ifunc}"></span>
+                    ]
+                    : qq[
+                        <td class="data"><span id="info_frm_$$flt{ifunc}"></span>
+                    ]
+                )
+            .
+                ($$set{has_precision_recall}
+                ? qq[
+                    <td class="data"><span id="info_tpr_$$flt{ifunc}"></span>
+                ] : '')
+            .qq[
+            <td class="qual"><span id="info_qual_$$flt{ifunc}"></span>
+            </tr>
+        ];
+    }
+    push @html,"</table>";
+
+    my $val_by_qual_input = $$self{compress} ?
+        'pako.inflate(Uint8Array.from(atob(val_by_qual[i]),c=>c.charCodeAt(0)),{to:"string"})' :
+        'val_by_qual[i]';
+
+    my @i2class;
+    for my $i (sort {$a<=>$b} keys %{$$set{func2filter}}) { push @i2class,$$set{func2filter}{$i}{class}; }
+    my $i2class = '"'.join('","',@i2class).'"';
+
+    my $html_preflt = defined($$set{prefilter}) ? "<br>pre-filtered: $$set{prefilter}" : '';
+    my $precision_recall = $$set{has_precision_recall} ? 'tpr: +d.tpr' : '';
+    my $d3_parse = $type eq 'snv' ?
+        qq[
+            titv: +d.titv,
+            oe_syn: +d.oe_syn,
+            lo_syn: +d.lo_syn,
+            hi_syn: +d.hi_syn,
+            oe_mis: +d.oe_mis,
+            lo_mis: +d.lo_mis,
+            hi_mis: +d.hi_mis,
+        ] :
+        qq[
+            frm: +d.frm,
+        ];
+
+    print {$fh} << "EOT";
+
+    let expr2class = [$i2class];
+    let obj = {};
+    window.onload = function() {
+        obj.sel = {};   // selected combination of clickable parts
+        obj.dim = { width:$width, height:$height, margin:$margin };
+
+        // parse the data
+        obj.data = [];
+        for (i in val_by_qual)
+        {
+            let dat = d3.csvParse($val_by_qual_input,function(d) {
+                return {
+                    x: +d.size,
+                    y: +d.vaf25,
+                    y0: undefined,
+                    y1: undefined,
+                    oe_size: +d.oesize,
+                    qual: +d.qual,
+                    sort_by: d.sort_by,
+                    vaf: +d.vaf25,
+                    dup: +d.dup,
+                    $d3_parse
+                    $precision_recall
+                }
+            });
+            obj.data.push({key:i, values:dat});
+        }
+        plot_data(obj);
+
+        // terminology:
+        //      part .. synonymous with the css class "part", it is a clickable part of the expression, eg "-1" in "X>{-1,-5,-10}"
+        //      line .. this is a line in the graph
+        //      expr .. one of the expanded expressions, e.g. "X>-1"
+        //      info .. text updated on mouse move for each expression
+
+        // make hover on each expression/part/line highlight the corresponding elements
+        //  - this one to hover over expanded expressions, their ids are expr0,expr1,..
+        //  - the next one is over parts, their ids are x0_17,x0_33,..
+        //  - hovering over lines is initialized in plot_data() when lines are appended via obj.graph.selectAll(".line") statement
+        for (i in obj.data)
+        {
+            let idx = obj.data[i].key;
+            d3.select('#expr'+idx)
+                .on("mouseover", function(event) { hover_line(obj,this,1); })
+                .on("mouseout", function(event) { hover_line(obj,this,0); })
+                .on("click", function(event) { toggle_line(obj,this); });
+        }
+        d3.selectAll(".part")
+            .on("mouseover", function(event) { hover_part(obj,this,1); })
+            .on("mouseout", function(event) { hover_part(obj,this,0); })
+            .on("click", function(event) { toggle_part(obj,this); });
+    }
+    function hover_line(obj,item,show)
+    {
+        let idx = typeof item=="string" ? +item : item.getAttribute('name').substring(4);
+
+        // when hovering over lines and expanded expressions, temporarily hide selections
+        if ( show==1 )
+        {
+            d3.selectAll('.part').classed("clicked",0);
+            d3.selectAll('.expr').classed("clicked",0);
+            obj.graph.selectAll(".line").classed("clicked",0);
+        }
+        else
+        {
+            // mouseout event, update the view
+            update_hover_view(obj);
+        }
+
+        // expanded expressions
+        d3.select('#expr'+idx).classed("hovered",show==1 ? 1 : 0);
+
+        // lines of the graph
+        obj.graph.selectAll("#line"+idx)
+            .classed("hovered",show==1 ? 1 : 0)
+            .filter(function(d) { return show==1; })
+            .raise();
+
+        // confidence intervals
+        obj.graph.selectAll("#area"+idx)
+            .classed("hovered",show==1 ? 1 : 0)
+            .filter(function(d) { return show==1; })
+            .raise();
+
+        // clickable parts, classes can be e.g. class="expr x0_17 x0_33"
+        let classes = d3.select('#expr'+idx).node().classList;
+        for (const cls of classes)
+            d3.select('#'+cls).classed("hovered",show==1 ? 1 : 0);
+    }
+    function hover_part(obj,item,show)
+    {
+        // Hovering is straightforward when nothing is clicked. However, when a part
+        // of the expression has been selected, we want to show only the intersection
+
+        // item.id is e.g. "x0_17"
+
+        // Simple hovering mode
+        if ( !Object.keys(obj.sel).length || !show )
+        {
+            // highlight lines
+            d3.selectAll("path."+item.id)       // item.id is the expandable element class, e.g. x0_20
+                .classed("hovered",show==1 ? 1 : 0)
+                .filter(function(d) { return show==1; })
+                .raise();
+
+            // and the corresponding expanded expressions
+            d3.selectAll("."+item.id)
+                .classed("hovered",show==1 ? 1 : 0);
+        }
+
+        if ( obj.hov && obj.hov==item.id && show==0 ) obj.hov = undefined;  // mouseout event
+        else
+        {
+            obj.hov = item.id;
+            d3.select('#'+item.id).classed("hovered",1);
+        }
+
+        update_hover_view(obj);
+    }
+    function update_hover_view(obj)
+    {
+       // Add/remove the class ("clicked" or "hovered") to the active expressions and lines
+       for (line of obj.lines.nodes())
+       {
+           let has_all = 0;
+           for (x in obj.sel)  // x is e.g. "x0_17"
+           {
+               if ( !d3.select(line).classed(x) ) { has_all = 0; break; }
+               has_all = 1;
+           }
+           if ( obj.hov && has_all && !d3.select(line).classed(obj.hov) ) has_all = 0;
+
+           d3.select(line)
+                .classed("clicked",has_all==1 ? 1 : 0)
+                .filter(function(d) { return has_all==1; })
+                .raise();
+
+           let idx = line.getAttribute('name').substring(4);
+           d3.select('#expr'+idx).classed("clicked",has_all==1 ? 1 : 0);
+           d3.select('#tr'+idx).classed("clicked",has_all==1 ? 1 : 0);
+       }
+       for (x in obj.sel)  // x is e.g. "x0_17"
+           d3.select('#'+x).classed("clicked",1);
+    }
+    function toggle_line(obj,item)
+    {
+        let turn_on = !d3.select(item).classed("clicked");
+
+        obj.hov = undefined;
+        obj.sel = {};
+        if ( turn_on )
+        {
+            let classes = d3.select(item).node().classList;
+            for (const cls of classes)
+                if ( cls.substr(0,1)=="x" ) obj.sel[cls] = 1;   // NB: relies on only expression classes (eg "x0_17") starting with "x"
+        }
+        d3.select(item).classed("clicked",turn_on==1 ? 1 : 0);
+
+        let idx_item = item.getAttribute('name').substring(4);
+        for (i in obj.data)
+        {
+            let idx_line = obj.data[i].key;
+
+            // toggle expression
+            d3.select('#expr'+idx_line)
+                .classed("clicked",(turn_on && idx_line==idx_item) ? 1 : 0);
+
+            // toggle line
+            obj.graph
+                .selectAll(".line")
+                .filter(function(d) { return d.key === idx_line; })
+                .classed("clicked",(turn_on && idx_line==idx_item) ? 1 : 0)
+                .filter(function(d) { return (turn_on && idx_line==idx_item); })
+                .raise();
+        }
+        d3.selectAll(".part")
+            .classed("clicked",function(d,i,j){
+                return obj.sel[this.id] ? 1 : 0;
+            });
+    }
+    function toggle_part(obj,item)
+    {
+        // The item.id is e.g. "x0_36". We go through all parts of the expandable expression and
+        // toggle their 'selected' status, it is recorded in the obj.sel hash.
+        // At this time add/remove the "clicked" css class
+        d3.selectAll("#"+item.id)
+            .classed("clicked",function(){
+                if ( obj.sel[this.id] ) delete(obj.sel[this.id]);
+                else obj.sel[this.id] = 1;
+                return obj.sel[this.id];
+            });
+        obj.hov = undefined;
+        update_hover_view(obj);
+    }
+    function pin_info(obj,dat)
+    {
+        obj.pin = !obj.pin;
+        obj.info_line.classed("clicked",obj.pin);
+        if ( obj.pin )
+        {
+            obj.pin_x = obj.xscale.invert(dat[0]-obj.dim.margin);
+            obj.info_line.attr("transform", "translate("+(obj.xscale(obj.pin_x))+",0)");
+        }
+        show_info(obj,dat);
+    }
+    function oe_color(obj,oe)
+    {
+        if ( obj.greens==null )
+        {
+            obj.colors_green = d3.scaleSequential(d3.interpolateGreens).domain([0,20]);
+            obj.colors_red   = d3.scaleSequential(d3.interpolateReds).domain([0,20]);
+        }
+        let colors = oe < 1 ? obj.colors_red : obj.colors_green;
+        let val = Math.abs(1-oe)*10;
+        if ( val > 10 ) val = 10;
+        return colors(val);
+    }
+    function format_ci(y0,y,y1)
+    {
+        return '<span class="ci">'+y0.toFixed(2)+'</span>'+
+               '_ '+y.toFixed(2)+' _' +
+               '<span class="ci">'+y1.toFixed(2)+'</span>';
+    }
+    function show_info(obj,dat)
+    {
+        if ( obj.pin ) return;
+
+        obj.info_line.attr("transform", "translate("+(dat[0] - obj.dim.margin)+",0)");
+
+        const x = obj.xscale.invert(dat[0]-obj.dim.margin);
+        const y = obj.yscale.invert(dat[1]-obj.dim.margin);
+        let xr = obj.xscale.domain();
+        let yr = obj.yscale.domain();
+        let dx = (xr[1] - xr[0])*0.05;
+        let dy = (yr[1] - yr[0])*0.05;
+        for (i in obj.data)
+        {
+            let idx  = obj.data[i].key;
+            let data = obj.data[i].values;
+
+            let j = d3.bisector(d => d.x).left(data, x);
+            if ( j==data.length ) j = data.length - 1;
+
+            let show = (dy > Math.abs(data[j].y - y) && dx > Math.abs(data[j].x - x)) ? 1 : 0;
+            hover_line(obj,idx,show);
+
+            let qual = data[j].qual + ':' + data[j].sort_by;
+            let titv = null;
+            let vaf = data[j].vaf.toFixed(2);
+            let dup = data[j].dup.toFixed(2);
+            let size = Math.round(data[j].x);
+            let oe_size = (data[j].oe_size).toFixed(2);
+            let oe_syn  = null;
+            let oe_mis  = null;
+            let frm = null;
+            let precision = null;
+            let recall = null;
+            if ( data[j].hasOwnProperty('titv') )
+            {
+                titv = data[j].titv.toFixed(2);
+                oe_syn  = format_ci(data[j].lo_syn,data[j].oe_syn,data[j].hi_syn);
+                oe_mis  = format_ci(data[j].lo_mis,data[j].oe_mis,data[j].hi_mis);
+            }
+            else
+                frm = data[j].frm.toFixed(2);
+
+            if ( data[j].hasOwnProperty('tpr')  )
+                tpr = data[j].tpr;
+
+            if ( j==0 || j==data.length-1 )
+            {
+                qual = '<span class="ofb">'+qual+'</span>';
+                size = '<span class="ofb">'+size+'</span>';
+                oe_size = '<span class="ofb">'+oe_size+'</span>';
+                vaf = '<span class="ofb">'+vaf+'</span>';
+                dup = '<span class="ofb">'+dup+'</span>';
+                if ( titv!=null )
+                {
+                    titv = '<span class="ofb">'+titv+'</span>';
+                    oe_syn  = '<span class="ofb">'+oe_syn+'</span>';
+                    oe_mis  = '<span class="ofb">'+oe_mis+'</span>';
+                }
+                else
+                    frm = '<span class="ofb">'+frm+'</span>';
+                if ( tpr!=null )
+                {
+                    tpr = '<span class="ofb">'+tpr+'</span>';
+                }
+            }
+
+            d3.select('#info_qual_'+idx).html(qual);
+            d3.select('#info_size_'+idx).html(size);
+            d3.select('#info_oesize_'+idx).html(oe_size).style('background-color',oe_color(obj,oe_size));
+            d3.select('#info_vaf_'+idx).html(vaf);
+            d3.select('#info_dup_'+idx).html(dup);
+            if ( titv!=null )
+            {
+                d3.select('#info_titv_'+idx).html(titv);
+                d3.select('#info_syn_'+idx).html(oe_syn);
+                d3.select('#info_mis_'+idx).html(oe_mis);
+            }
+            else
+                d3.select('#info_frm_'+idx).html(frm);
+            if ( tpr!=null )
+            {
+                d3.select('#info_tpr_'+idx).html(tpr);
+            }
+        }
+
+        const div = d3.select("#container");
+        const width = div.node().getBoundingClientRect().width;
+        if ( obj.min_width==null || obj.min_width < width ) obj.min_width = Math.round(width);
+        div.style("width", obj.min_width+"px");
+    }
+
+    function plot_data(obj)
+    {
+        // The function can be called repeatedly, make sure that only the relevant parts are recreated
+        let first_time = obj.lines ? 0 : 1;
+
+        if ( !first_time ) obj.lines.remove();
+
+        // create scales and axes
+        if ( first_time )
+        {
+            obj.xscale = obj.x = d3.scaleLinear().range([ 0, obj.dim.width ]);
+            obj.yscale = obj.y = d3.scaleLinear().range([ obj.dim.height, 0 ]);
+            obj.x.domain([0.95*d3.min(obj.data.flatMap(group=>group.values),d=>d.x),1.05*d3.max(obj.data.flatMap(group=>group.values),d=>d.x)]);
+            obj.xax = d3.axisBottom(obj.x);
+        }
+        obj.y.domain([0.95*d3.min(obj.data.flatMap(group=>group.values),d=>d.y),1.05*d3.max(obj.data.flatMap(group=>group.values),d=>d.y)]);
+        obj.yax = d3.axisLeft(obj.y);
+
+        if ( first_time )
+        {
+            obj.zoom = d3.zoom()
+                .scaleExtent([1e-3, 1e3])
+                .extent([[0,0],[obj.dim.width,obj.dim.height]])
+                .on("zoom", function(event) { zoomed(obj,event); });
+
+            // create svg
+            obj.svg = d3.select("#val_by_qual")
+                .append("svg")
+                .attr("width", obj.dim.width+2*obj.dim.margin)
+                .attr("height", obj.dim.height+2*obj.dim.margin)
+                .call(obj.zoom)
+                .style("pointer-events", "all")
+                .on("mouseover", function(event) { obj.info_line.style("opacity",0.5); })
+                .on("mouseout", function(event) {
+                    if ( !obj.pin ) obj.info_line.style("opacity",0);
+                })
+                .on("mousemove", function(event) { show_info(obj,d3.pointer(event,this)); })
+                .on("click", function(event) { pin_info(obj,d3.pointer(event,this)); });
+            obj.graph = obj.svg
+                .append("g")
+                .attr("transform","translate("+ obj.dim.margin +","+ obj.dim.margin +")");
+
+            obj.svg
+                .append("defs").append("clipPath")
+                .attr("id", "clip")
+                .append("rect")
+                .attr("width", obj.dim.width)
+                .attr("height", obj.dim.height);
+
+            obj.info_line = obj.svg
+                .append('line')
+                .attr("id", "info-line")
+                .attr("class", "info-line")
+                .attr("stroke", "black")
+                .attr("stroke-width", 1)
+                .attr("pointer-events", "none")     // otherwise the line might trigger mouse events
+                .style("opacity",0)
+                .attr("x1", obj.dim.margin)
+                .attr("x2", obj.dim.margin)
+                .attr("y1", obj.dim.margin)
+                .attr("y2", obj.dim.margin + obj.dim.height);
+        }
+
+        // are for confidence intervals
+        if ( obj.y0_y1 )
+        {
+            obj.areas = obj.graph.selectAll(".area")
+                .data(obj.data)
+                .enter()
+                .append("path")
+                .attr("clip-path", "url(#clip)")
+                .attr("class", "area")
+                .attr("id", function(d){ return "area"+d.key; })
+                .attr("d", function(d){
+                    return d3.area()
+                        .x(function(d) { return obj.x(d.x); })
+                        .y0(function(d) { return obj.y(d.y0); })
+                        .y1(function(d) { return obj.y(d.y1); })
+                        (d.values);
+                    });
+        }
+
+        // data lines
+        obj.lines = obj.graph.selectAll(".line")
+            .data(obj.data)
+            .enter()
+            .append("path")
+            .attr("clip-path", "url(#clip)")
+            .attr("fill", "none")
+            .style("opacity",0.9)
+            .attr("stroke-width", $wd0)
+            .attr("stroke", "$color0")        // function(d){ return obj.colors(d.key) })
+            .attr("name", function(d){ return "line"+d.key; })              // each line is associated with the expression id
+            .attr("id", function(d){ return "line"+d.key; })
+            .attr("class", function(d){ return "line"+expr2class[d.key]; }) // each line has classes corresponding to the clickable elements in the boolean expression
+            .attr("d", function(d){
+                x = d3.line()
+                    .x(function(d) { return obj.x(d.x); })
+                    .y(function(d) { return obj.y(d.y); })
+                    (d.values);
+                return x;
+                });
+
+        // axes and their labels
+        if ( first_time )
+        {
+            obj.svg.append("text")
+                .attr("x", (obj.dim.width/2) )
+                .attr("y",  obj.dim.height + obj.dim.margin*2 )
+                .style("text-anchor", "middle")
+                .text("Callset Size");
+            obj.ylabel = obj.svg.append("text")
+                .attr("id","yaxis-label")
+                .attr("transform", "rotate(-90)")
+                .attr("y", 0)
+                .attr("x",0 - ((obj.dim.height+obj.dim.margin)/2))
+                .attr("dy", "1em")
+                .style("text-anchor", "middle")
+                .text("VAF25 [%]");
+
+            obj.xaxis = obj.graph.append("g")
+                .attr("class", "axis axis--x")
+                .attr("transform", "translate(0," + (obj.dim.height-1) + ")")
+                .call(obj.xax);
+        }
+        else
+            obj.yaxis.remove();
+
+        obj.yaxis = obj.graph.append("g")
+            .attr("class", "axis axis--y")
+            .call(obj.yax);
+    }
+    function zoomed(obj,event)
+    {
+        if ( event==null ) event = obj.zoom_event;
+        if ( event==null ) return;
+        obj.zoom_event = event;
+        if ( event.sourceEvent.shiftKey || event.sourceEvent.ctrlKey )
+            obj.yscale = event.transform.rescaleY(obj.y);
+        else
+        {
+            obj.xscale = event.transform.rescaleX(obj.x);
+            const visibleData = obj.data.flatMap(group=>group.values).filter((d) => {
+                        const x = obj.xscale(d.x);
+                        return x >= 0 && x <= obj.dim.width;
+                    });
+            obj.y.domain([0.95*d3.min(visibleData,(d)=>d.y),1.05*d3.max(visibleData,d=>d.y)]);
+        }
+        obj.graph.select(".axis--x").call(d3.axisBottom(obj.xscale));
+        obj.graph.select(".axis--y").call(d3.axisLeft(obj.yscale));
+        obj.graph.selectAll("path.line")
+            .attr("d", function(d) {
+                return d3.line()
+                    .x(function(d) { return obj.xscale(d.x); })
+                    .y(function(d) { return obj.yscale(d.y); })
+                    (d.values);
+            });
+        if ( obj.y0_y1 )
+        {
+            obj.graph.selectAll("path.area")
+                .attr("d", function(d) {
+                    return d3.area()
+                        .x(function(d) { return obj.xscale(d.x); })
+                        .y0(function(d) { return obj.yscale(d.y0); })
+                        .y1(function(d) { return obj.yscale(d.y1); })
+                        (d.values);
+                });
+        }
+
+        if ( obj.pin_x!=null )
+            obj.info_line.attr("transform", "translate("+(obj.xscale(obj.pin_x))+",0)");
+    }
+    function val_by_becomes(obj,metric)
+    {
+        if ( obj.areas ) obj.areas.remove();
+
+        let label = 'yaxis';
+        if ( metric=='vaf' )
+        {
+            label = 'VAF25 [%]';
+            obj.data.forEach(item => { item.values = item.values.map(d => { d.y = d.vaf; return d; }); });
+            obj.y0_y1 = 0;
+        }
+        else if ( metric=='oe_size' )
+        {
+            label = 'O/E Size';
+            obj.data.forEach(item => { item.values = item.values.map(d => { d.y = d.oe_size; return d; }); });
+            obj.y0_y1 = 0;
+        }
+        else if ( metric=='dup' )
+        {
+            label = 'Sites with duplicates [%]';
+            obj.data.forEach(item => { item.values = item.values.map(d => { d.y = d.dup; return d; }); });
+            obj.y0_y1 = 0;
+        }
+        else if ( metric=='titv' )
+        {
+            label = 'Ti/Tv';
+            obj.data.forEach(item => { item.values = item.values.map(d => { d.y = d.titv; return d; }); });
+            obj.y0_y1 = 0;
+        }
+        else if ( metric=='frm' )
+        {
+            label = 'Frameshifts';
+            obj.data.forEach(item => { item.values = item.values.map(d => { d.y = d.frm; return d; }); });
+            obj.y0_y1 = 0;
+        }
+        else if ( metric=='oe_syn' )
+        {
+            label = 'Obs/Exp synonymous DNMs';
+            obj.data.forEach(item => { item.values = item.values.map(d => { d.y = d.oe_syn; d.y0 = d.lo_syn; d.y1 = d.hi_syn; return d; }); });
+            obj.y0_y1 = 1;
+        }
+        else if ( metric=='oe_mis' )
+        {
+            label = 'Obs/Exp missense DNMs';
+            obj.data.forEach(item => { item.values = item.values.map(d => { d.y = d.oe_mis; d.y0 = d.lo_mis; d.y1 = d.hi_mis; return d; }); });
+            obj.y0_y1 = 1;
+        }
+        else if ( metric=='tpr' )
+        {
+            label = 'True Positive Rate [%]';
+            obj.data.forEach(item => { item.values = item.values.map(d => { d.y = d.tpr; return d; }); });
+        }
+        else return;
+
+        plot_data(obj);
+        obj.svg.selectAll("#yaxis-label").text(label);
+        zoomed(obj,null);
+        update_hover_view(obj);
+    }
+
+  </script>
+</head>
+<body>
+<div id='container' onresize="window.alert('resized')">
+    <div style='margin-left:${margin}px'>
+        <b>$label ($type)</b>
+        $html_preflt
+    </div>
+    <div id="val_by_qual"></div>
+EOT
+
+    print $fh "<div style='margin-left:${margin}px;'>".join('',@html)."\n</div>\n";
+    print {$fh} << "EOT";
+
+</div>
+</body>
+</html>
+EOT
+
+    close($fh) or $self->throw("close failed: $$set{plots}.$type.html");
+}
+
+sub embed_js
+{
+    my ($self,$file) = @_;
+    if ( $file=~m{^http}i )
+    {
+        my $tmp = "$$self{outdir}.rmme";
+        $self->cmd(qq[wget -O $tmp $file]);
+        my $dat = join('',`cat $tmp`);
+        unlink($tmp);
+        return $dat;
+    }
+    return join('',`cat $file`);
+}
+
+sub filter_at
+{
+    my ($self,$outfile) = @_;
+    my ($lbl,$expr,$th) = split(/,/,$$self{filter});
+    my $set;
+    for my $tmp (@{$$self{sets}})
+    {
+        if ( $$tmp{name} eq $lbl ) { $set = $tmp; last; }
+    }
+    if ( !defined($set) ) { $self->throw("No such set: $lbl\n"); }
+
+    my $flt = exists($$set{func2filter}{$expr-1}) ? $$set{func2filter}{$expr-1} : undef;
+    if ( !defined($flt) ) { $self->throw("No such expressiong: $expr\n"); }
+
+    my $outfile_soft = $outfile;
+    $outfile_soft =~ s/\.txt\.gz$//;
+    $outfile_soft .= '.soft.txt.gz';
+
+    my $hdr = $self->col_names($$set{flt});
+    my $iqual = $$hdr{rank};
+    my $ipass = $$hdr{pass};
+    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    open(my $sf,"| gzip -c > $outfile_soft") or $self->throw("gzip -c > $outfile_soft: $!");
+    open(my $in,"gunzip -c $$set{flt} |") or $self->throw("gunzip -c $$set{flt}: $!");
+    while (my $line=<$in>)
+    {
+        chomp($line);
+        if ( $line=~/^#/ )
+        {
+            my @col = split(/\t/,$line);
+            print $fh $line."\n";
+            printf $sf $line."\t[%d]run_filter_pass\n",1+@col;
+            next;
+        }
+        my @col = split(/\t/,$line);
+        my $pass = $col[$ipass];
+        if ( $pass eq '.' ) { print $sf $line."\t0\n"; next; }
+        my $is_pass = 0;
+        for my $x (split(/,/,$pass))
+        {
+            if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
+        }
+        if ( !$is_pass ) { print $sf $line."\t0\n"; next; }
+        if ( $col[$iqual] < $th ) { print $sf $line."\t0\n"; next; }
+        print $fh $line."\n";
+        print $sf $line."\t1\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    close($sf) or $self->throw("close failed: gzip -c > $outfile_soft");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+
+
