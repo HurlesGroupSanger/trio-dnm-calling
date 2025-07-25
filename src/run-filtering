@@ -142,8 +142,9 @@ sub new
         "       a DNM callset\n" .
         "Usage: run-filtering\n" .
         "Options:\n" .
-        "   -c  --compress 0|1          Compress the embedded data [$$self{compress}]\n" .
-        "   -e  --embed-d3 0|1          Embed the JS d3 library within the generated HTML files [$$self{embed_d3}]\n" .
+        "       --clean STR             Clean all results for this set to allow rerun\n" .
+        "   -c, --compress 0|1          Compress the embedded data [$$self{compress}]\n" .
+        "   -e, --embed-d3 0|1          Embed the JS d3 library within the generated HTML files [$$self{embed_d3}]\n" .
         "   -f, --filter STR,INT,FLT    Create a filtered set; STR=label, INT=expression ID, FLT=threshold\n" .
         "   -o, --outdir DIR            Output directory\n" .
         "   -t, --trim-display FLT      Trim data points to prevent small-sample size fluctuations [0.05]\n" .
@@ -157,6 +158,7 @@ sub parse_args
     my ($self) = @_;
     while (defined(my $arg=shift(@ARGV)))
     {
+        if (                 $arg eq '--clean' ) { $$self{clean}=shift(@ARGV); next; }
         if ( $arg eq '-f' or $arg eq '--filter' ) { $$self{filter}=shift(@ARGV); next; }
         if ( $arg eq '-e' or $arg eq '--embed-d3' ) { $$self{embed_d3}=shift(@ARGV); next; }
         if ( $arg eq '-c' or $arg eq '--compress' ) { $$self{compress}=shift(@ARGV); next; }
@@ -173,6 +175,12 @@ sub main
 {
     my ($self) = @_;
     $self->parse_args();
+
+    if ( exists($$self{clean}) )
+    {
+        $self->clean;
+        $self->all_done;
+    }
 
     $self->cmd("mkdir -p $$self{outdir}/raw");
     $self->cmd("mkdir -p $$self{outdir}/preflt");
@@ -204,6 +212,20 @@ sub main
     $self->wait;
 
     $self->all_done;
+}
+
+sub clean
+{
+    my ($self) = @_;
+    for my $name (split(/,/,$$self{clean}))
+    {
+        $self->cmd(qq[rm -f $$self{outdir}/done/filter.$name]);
+        $self->cmd(qq[rm -f $$self{outdir}/raw/$name.txt.gz]);
+        $self->cmd(qq[rm -f $$self{outdir}/preflt/$name.txt.gz]);
+        $self->cmd(qq[rm -f $$self{outdir}/flt/{README.$name.txt,$name.txt.gz}]);
+        $self->cmd(qq[rm -f $$self{outdir}/plots/$name.{del,ins,snv}.html]);
+        $self->cmd(qq[rm -rf $$self{outdir}/plots/$name]);
+    }
 }
 
 sub save_config
@@ -1382,6 +1404,16 @@ th {
     fill: $color_hover;
     opacity: 0.3;
 }
+.area.clicked
+{
+    fill: $color_click;
+    opacity: 0.3;
+}
+.area.clicked.hovered
+{
+    fill: $color_click_hover;
+    opacity: 0.3;
+}
 .line,
 .expr {
     cursor:pointer;
@@ -1614,14 +1646,7 @@ EOT
     {
         let idx = typeof item=="string" ? +item : item.getAttribute('name').substring(4);
 
-        // when hovering over lines and expanded expressions, temporarily hide selections
-        if ( show==1 )
-        {
-            d3.selectAll('.part').classed("clicked",0);
-            d3.selectAll('.expr').classed("clicked",0);
-            obj.graph.selectAll(".line").classed("clicked",0);
-        }
-        else
+        if ( !show )
         {
             // mouseout event, update the view
             update_hover_view(obj);
@@ -1674,33 +1699,52 @@ EOT
             obj.hov = item.id;
             d3.select('#'+item.id).classed("hovered",1);
         }
-
         update_hover_view(obj);
     }
     function update_hover_view(obj)
     {
-       // Add/remove the class ("clicked" or "hovered") to the active expressions and lines
-       for (line of obj.lines.nodes())
-       {
-           let has_all = 0;
-           for (x in obj.sel)  // x is e.g. "x0_17"
-           {
-               if ( !d3.select(line).classed(x) ) { has_all = 0; break; }
-               has_all = 1;
-           }
-           if ( obj.hov && has_all && !d3.select(line).classed(obj.hov) ) has_all = 0;
+        // Add/remove the class ("clicked" or "hovered") to the active expressions and lines
+        for (line of obj.lines.nodes())
+        {
+            let has_all = 0;
+            for (x in obj.sel)  // x is e.g. "x0_17"
+            {
+                if ( !d3.select(line).classed(x) ) { has_all = 0; break; }
+                has_all = 1;
+            }
+            if ( obj.hov && has_all && !d3.select(line).classed(obj.hov) ) has_all = 0;
 
-           d3.select(line)
+            d3.select(line)
                 .classed("clicked",has_all==1 ? 1 : 0)
                 .filter(function(d) { return has_all==1; })
                 .raise();
 
-           let idx = line.getAttribute('name').substring(4);
-           d3.select('#expr'+idx).classed("clicked",has_all==1 ? 1 : 0);
-           d3.select('#tr'+idx).classed("clicked",has_all==1 ? 1 : 0);
-       }
-       for (x in obj.sel)  // x is e.g. "x0_17"
-           d3.select('#'+x).classed("clicked",1);
+            let idx = line.getAttribute('name').substring(4);
+            d3.select('#expr'+idx).classed("clicked",has_all==1 ? 1 : 0);
+            d3.select('#tr'+idx).classed("clicked",has_all==1 ? 1 : 0);
+        }
+        if ( obj.areas )
+        {
+            for (area in obj.areas.nodes())
+            {
+                let id = '#area'+area;
+                let has_all = 0;
+                for (x in obj.sel)  // x is e.g. "x0_17"
+                {
+                    if ( !d3.select(id).classed(x) ) { has_all = 0; break; }
+                    has_all = 1;
+                }
+                if ( obj.hov && has_all && !d3.select(id).classed(obj.hov) ) has_all = 0;
+
+                d3.select(id)
+                    .classed("clicked",has_all==1 ? 1 : 0)
+                    .filter(function(d) { return has_all==1; })
+                    .raise();
+            }
+        }
+
+        for (x in obj.sel)  // x is e.g. "x0_17"
+            d3.select('#'+x).classed("clicked",1);
     }
     function toggle_line(obj,item)
     {
@@ -1728,6 +1772,14 @@ EOT
             // toggle line
             obj.graph
                 .selectAll(".line")
+                .filter(function(d) { return d.key === idx_line; })
+                .classed("clicked",(turn_on && idx_line==idx_item) ? 1 : 0)
+                .filter(function(d) { return (turn_on && idx_line==idx_item); })
+                .raise();
+
+            // toggle confidence intervals
+            obj.graph
+                .selectAll(".area")
                 .filter(function(d) { return d.key === idx_line; })
                 .classed("clicked",(turn_on && idx_line==idx_item) ? 1 : 0)
                 .filter(function(d) { return (turn_on && idx_line==idx_item); })
@@ -1944,8 +1996,9 @@ EOT
                 .enter()
                 .append("path")
                 .attr("clip-path", "url(#clip)")
-                .attr("class", "area")
+                .attr("name", function(d){ return "area"+d.key; })
                 .attr("id", function(d){ return "area"+d.key; })
+                .attr("class", function(d){ return "area"+expr2class[d.key]; }) // each line has classes corresponding to the clickable elements in the boolean expression
                 .attr("d", function(d){
                     return d3.area()
                         .x(function(d) { return obj.x(d.x); })
@@ -2047,7 +2100,11 @@ EOT
     }
     function val_by_becomes(obj,metric)
     {
-        if ( obj.areas ) obj.areas.remove();
+        if ( obj.areas )
+        {
+            obj.areas.remove();
+            obj.areas = undefined;
+        }
 
         let label = 'yaxis';
         if ( metric=='vaf' )
@@ -2108,7 +2165,7 @@ EOT
   </script>
 </head>
 <body>
-<div id='container' onresize="window.alert('resized')">
+<div id='container'>
     <div style='margin-left:${margin}px'>
         <b>$label ($type)</b>
         $html_preflt
