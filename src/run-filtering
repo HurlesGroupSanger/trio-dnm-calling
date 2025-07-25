@@ -225,6 +225,7 @@ sub clean
         $self->cmd(qq[rm -f $$self{outdir}/flt/{README.$name.txt,$name.txt.gz}]);
         $self->cmd(qq[rm -f $$self{outdir}/plots/$name.{del,ins,snv}.html]);
         $self->cmd(qq[rm -rf $$self{outdir}/plots/$name]);
+        $self->cmd(qq[rm -rf $$self{outdir}/.jobs $$self{outdir}/done/.jobs]);
     }
 }
 
@@ -1109,12 +1110,9 @@ sub calc_oesize_by_qual
     my $gsize = (grep {chomp} $self->cmd(qq[zcat $$set{targets} | awk '{s+=\$3-\$2+1}END{print s/1e6}']))[0];
     if ( $gsize ne $$set{gsize} ) { $self->warn("\nWarning: gsize is different in $$self{targets}: targets=$gsize vs gsize=$$set{gsize}\n\n"); }
     my $nexp = $$set{nsmpl} * $gsize * 1e6 * $$self{"mrate_$$flt{type}"};
-    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
-    print $fh join("\t",qw(qual oesize))."\n";
-    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
-    my $cmd = qq[stats q -c qs | awk '{OFS="\\t"}{print \$1,\$2/$nexp}' | gzip -c >> $outfile.part];
+    my $cmd = qq[stats q -c qs | gzip -c > $outfile.part];
     print STDERR "$cmd\n";
-    open($fh,"| $cmd") or $self->throw("$cmd: $!");
+    open(my $fh,"| $cmd") or $self->throw("$cmd: $!");
     open(my $in,"gunzip -c $$set{flt} |") or $self->throw("gunzip -c $$set{flt}: $!");
     while (my $line=<$in>)
     {
@@ -1134,7 +1132,30 @@ sub calc_oesize_by_qual
     }
     close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
     close($fh) or $self->throw("close failed: $cmd");
-    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+
+    open($fh,'>',"$outfile.r") or $self->throw("$outfile.r: $!");
+    print $fh qq[
+
+        # read the data in: qual,nsyn,nmis,size
+        x <- read.csv("$outfile.part",sep="\\t",header=FALSE)
+        results <- data.frame(
+            qual = numeric(),
+            oe_size = numeric(),
+            lo_size = numeric(),
+            hi_size = numeric(),
+            size = numeric())
+
+        for (i in 1:nrow(x))
+        {
+            ci  <- poisson.test(x[i,2],$nexp)\$conf.int
+            results[i, ] <- c(x[i,1],x[i,2]/$nexp,min(ci),max(ci),x[i,3])
+        }
+        write.table(results, gzfile("$outfile.partx"), quote=FALSE, row.names=FALSE, sep="\\t")
+    ];
+    close($fh) or $self->throw("close failed: $outfile.r");
+    $self->cmd(qq[Rscript $outfile.r]);
+    rename("$outfile.partx",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+    unlink("$outfile.part");
 }
 sub create_rank2sort_by
 {
@@ -1297,10 +1318,11 @@ sub merge_data
         }
         if ( $done ) { last; }
         if ( !scalar %out ) { next; }   # first line only, the headers
+        if ( scalar %out != scalar @$cnames ) { $self->throw("Out of sync: \n\t".join("\n\t",@$fnames)."\n"); }
         my @out = ();
         for my $cname (@$cnames)
         {
-            if ( !exists($out{$cname}) ) { $self->throw("No column $cname in the files\n"); }
+            if ( !exists($out{$cname}) ) { $self->throw("No column \"$cname\" in the files\n\t".join("\n\t",@$fnames)."\n"); }
             push @out,$out{$cname};
         }
         push @dat,join(",",@out)."\n";
@@ -1513,8 +1535,8 @@ EOT
             [$$flt{rank2sort_by},$$flt{oesize_by_qual},$$flt{vaf_by_qual},$$flt{dup_by_qual},$$flt{titv_by_qual},$$flt{csq_by_qual}] :
             [$$flt{rank2sort_by},$$flt{oesize_by_qual},$$flt{vaf_by_qual},$$flt{dup_by_qual},$$flt{csq_by_qual}];
         my $cols  = $type eq 'snv' ?
-            [qw(oesize qual sort_by size vaf25 dup titv oe_syn lo_syn hi_syn oe_mis lo_mis hi_mis)] :
-            [qw(oesize qual sort_by size vaf25 dup frm)];
+            [qw(oe_size lo_size hi_size qual sort_by size vaf25 dup titv oe_syn lo_syn hi_syn oe_mis lo_mis hi_mis)] :
+            [qw(oe_size lo_size hi_size qual sort_by size vaf25 dup frm)];
         if ( $$set{has_precision_recall} )
         {
             push @$files,$$flt{tpr_by_qual};
@@ -1606,7 +1628,9 @@ EOT
                     y: +d.vaf25,
                     y0: undefined,
                     y1: undefined,
-                    oe_size: +d.oesize,
+                    oe_size: +d.oe_size,
+                    lo_size: +d.lo_size,
+                    hi_size: +d.hi_size,
                     qual: +d.qual,
                     sort_by: d.sort_by,
                     vaf: +d.vaf25,
@@ -1861,7 +1885,7 @@ EOT
             let vaf = data[j].vaf.toFixed(2);
             let dup = data[j].dup.toFixed(2);
             let size = Math.round(data[j].x);
-            let oe_size = (data[j].oe_size).toFixed(2);
+            let oe_size = format_ci(data[j].lo_size,data[j].oe_size,data[j].hi_size);
             let oe_syn  = null;
             let oe_mis  = null;
             let frm = null;
@@ -1902,7 +1926,7 @@ EOT
 
             d3.select('#info_qual_'+idx).html(qual);
             d3.select('#info_size_'+idx).html(size);
-            d3.select('#info_oesize_'+idx).html(oe_size).style('background-color',oe_color(obj,oe_size));
+            d3.select('#info_oesize_'+idx).html(oe_size);
             d3.select('#info_vaf_'+idx).html(vaf);
             d3.select('#info_dup_'+idx).html(dup);
             if ( titv!=null )
@@ -2116,8 +2140,8 @@ EOT
         else if ( metric=='oe_size' )
         {
             label = 'O/E Size';
-            obj.data.forEach(item => { item.values = item.values.map(d => { d.y = d.oe_size; return d; }); });
-            obj.y0_y1 = 0;
+            obj.data.forEach(item => { item.values = item.values.map(d => { d.y = d.oe_size; d.y0 = d.lo_size; d.y1 = d.hi_size; return d; }); });
+            obj.y0_y1 = 1;
         }
         else if ( metric=='dup' )
         {
