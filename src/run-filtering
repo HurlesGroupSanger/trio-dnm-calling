@@ -998,8 +998,8 @@ sub calc_csq_by_qual_snv
     my $itgt  = $$hdr{tgt};
     my $esyn  = $$set{nsmpl}*$$self{exp_syn};
     my $emis  = $$set{nsmpl}*$$self{exp_mis};
-    my $elof  = $$set{nsmpl}*$$self{exp_lof};
-    my $estop = $$set{nsmpl}*$$self{exp_stop};
+    #my $elof  = $$set{nsmpl}*$$self{exp_lof};
+    #my $estop = $$set{nsmpl}*$$self{exp_stop};
     my $cmd = qq[stats q -c qss | gzip -c > $outfile.part];
     print STDERR "$cmd\n";
     open(my $fh,"| $cmd") or $self->throw("$cmd: $!");
@@ -1665,6 +1665,14 @@ EOT
             .on("mouseover", function(event) { hover_part(obj,this,1); })
             .on("mouseout", function(event) { hover_part(obj,this,0); })
             .on("click", function(event) { toggle_part(obj,this); });
+
+        var pin = new URL(window.location.href).searchParams.get("pin");
+        if ( pin )
+        {
+            show_info(obj,null,pin);
+            pin_info(obj,null);
+            obj.info_line.style("opacity",1);
+        }
     }
     function hover_line(obj,item,show)
     {
@@ -1834,10 +1842,20 @@ EOT
         obj.info_line.classed("clicked",obj.pin);
         if ( obj.pin )
         {
-            obj.pin_x = obj.xscale.invert(dat[0]-obj.dim.margin);
+            const pin = new URL(window.location.href).searchParams.get("pin");
+            if ( pin )
+                obj.pin_x = pin;
+            else
+                obj.pin_x = obj.xscale.invert(dat[0]-obj.dim.margin);
             obj.info_line.attr("transform", "translate("+(obj.xscale(obj.pin_x))+",0)");
         }
-        show_info(obj,dat);
+        if ( obj.pin )
+            history.replaceState(null, "", window.location.pathname + "?pin=" + obj.pin_x);
+        else
+        {
+            show_info(obj,dat);
+            history.replaceState(null, "", window.location.pathname);
+        }
     }
     function oe_color(obj,oe)
     {
@@ -1857,14 +1875,23 @@ EOT
                '_ '+y.toFixed(2)+' _' +
                '<span class="ci">'+y1.toFixed(2)+'</span>';
     }
-    function show_info(obj,dat)
+    function show_info(obj,dat,pin)
     {
         if ( obj.pin ) return;
 
-        obj.info_line.attr("transform", "translate("+(dat[0] - obj.dim.margin)+",0)");
+        var x,y;
+        if ( dat )
+        {
+            obj.info_line.attr("transform", "translate("+(dat[0] - obj.dim.margin)+",0)");
+            x = obj.xscale.invert(dat[0]-obj.dim.margin);
+            y = obj.yscale.invert(dat[1]-obj.dim.margin);
+        }
+        else
+        {
+            x = Number(pin);
+            y = 0;
+        }
 
-        const x = obj.xscale.invert(dat[0]-obj.dim.margin);
-        const y = obj.yscale.invert(dat[1]-obj.dim.margin);
         let xr = obj.xscale.domain();
         let yr = obj.yscale.domain();
         let dx = (xr[1] - xr[0])*0.05;
