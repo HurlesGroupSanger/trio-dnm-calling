@@ -1673,6 +1673,12 @@ EOT
             pin_info(obj,null);
             obj.info_line.style("opacity",1);
         }
+        var show = new URL(window.location.href).searchParams.get("show");
+        if ( show )
+        {
+            var item = d3.selectAll("#expr"+show).node();
+            toggle_line(obj,item);
+        }
     }
     function hover_line(obj,item,show)
     {
@@ -1793,6 +1799,7 @@ EOT
         d3.select(item).classed("clicked",turn_on==1 ? 1 : 0);
 
         let idx_item = item.getAttribute('name').substring(4);
+        toggle_url("show",turn_on ? idx_item : null);
         for (i in obj.data)
         {
             let idx_line = obj.data[i].key;
@@ -1836,6 +1843,14 @@ EOT
         obj.hov = undefined;
         update_hover_view(obj);
     }
+    function toggle_url(key,value)
+    {
+        const url = new URL(window.location);
+        const params = url.searchParams;
+        if ( params.has(key) ) params.delete(key);
+        if ( value!=null ) params.set(key, value);
+        history.replaceState(null, "", window.location.pathname + '?' + params.toString());
+    }
     function pin_info(obj,dat)
     {
         obj.pin = !obj.pin;
@@ -1849,13 +1864,8 @@ EOT
                 obj.pin_x = obj.xscale.invert(dat[0]-obj.dim.margin);
             obj.info_line.attr("transform", "translate("+(obj.xscale(obj.pin_x))+",0)");
         }
-        if ( obj.pin )
-            history.replaceState(null, "", window.location.pathname + "?pin=" + obj.pin_x);
-        else
-        {
-            show_info(obj,dat);
-            history.replaceState(null, "", window.location.pathname);
-        }
+        if ( obj.pin ) show_info(obj,dat);
+        toggle_url("pin", obj.pin ? obj.pin_x : null);
     }
     function oe_color(obj,oe)
     {
@@ -1889,7 +1899,7 @@ EOT
         else
         {
             x = Number(pin);
-            y = 0;
+            y = -100;
         }
 
         let xr = obj.xscale.domain();
