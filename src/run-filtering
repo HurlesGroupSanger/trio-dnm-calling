@@ -113,7 +113,8 @@ sub new
         # Substitute missing values (".")
         missing => { SCBZ=>0 },
 
-        # Filtering expressions
+        # Filtering expressions. It is a good idea to pre-filter the set first, or else the running time
+        # can be long for O/E calculations which are done externally in R.
         prefilter => ']. $$self{prefilter} .q[',
         expr_snv => \[ ']. $$self{expr_snv}[0] .q[' \],
         expr_ins => \[ ']. $$self{expr_ins}[0] .q[' \],
@@ -128,7 +129,8 @@ sub new
         #   sets  =>
         #   [
         #       {
-        #           name  => 'alspac',
+        #           label => 'ALSPAC',  # human-readable title
+        #           name  => 'alspac',  # file name
         #           src   => '/path/to/tab-delimited-annotated-file.txt.gz',
         #           nsmpl => 1326,      # number of samples (trios)
         #           gsize => 36.7427,   # size of accessible genome, in Mbp
@@ -388,10 +390,12 @@ sub func_init
     {
         $str = $';
         my $var = $1;
-        if ( !exists($$hdr{$var}) ) { $self->throw("Error: no such column '$var'\n"); }
+        if ( !exists($$hdr{$var}) ) { $self->throw("Error: no such column '$var', cannot execute expression \"$expr\"\n"); }
         $tmp .= $` ."\$col[$$hdr{$var}]";
     }
     $tmp .= $str;
+
+    if ( $tmp=~/^\s*$/ ) { $tmp = 1; }  # empty expression
 
     my $func;
     my $ok = 0;
@@ -404,7 +408,7 @@ sub func_init
         };
         $ok = 1;
     ';
-    if ( !$ok or !defined $func ) { $self->throw("Could not compile the expression: $tmp\n"); }
+    if ( !$ok or !defined $func ) { $self->throw("Could not compile the expression: \"$tmp\"\n"); }
     return ($func,$tmp);
 }
 sub replace_missing
@@ -470,7 +474,7 @@ sub filter_set
         close($in) or $self->throw("close failed: zless $$set{preflt}");
         close($fh) or $self->throw("close failed: gzip -c > $tmp");
 
-        my @keys = ref($$self{sort_by}) eq 'ARRAY' ? @{$$self{sort_by}} : ($$self{sort_by});
+        my @keys = ref($$set{sort_by}) eq 'ARRAY' ? @{$$set{sort_by}} : ($$set{sort_by});
         my $sort;
         for my $key (@keys)
         {
@@ -840,9 +844,9 @@ sub calc_fdr_by_qual
 {
     my ($self,$outfile,$set,$flt) = @_;
     $$set{has_precision_recall} = 1;
-    if ( $self->is_finished($outfile) ) { return; }
     my $hdr = $self->col_names($$set{flt});
     if ( !exists($$hdr{curated}) ) { $$set{has_precision_recall} = 0; return; }
+    if ( $self->is_finished($outfile) ) { return; }
     my $ntp_tot = $self->ntp_tot($$set{raw},$$flt{type});
     my $iqual = $$hdr{rank};
     my $ipass = $$hdr{pass};
@@ -893,9 +897,9 @@ sub calc_tpr_by_qual
 {
     my ($self,$outfile,$set,$flt) = @_;
     $$set{has_precision_recall} = 1;
-    if ( $self->is_finished($outfile) ) { return; }
     my $hdr = $self->col_names($$set{flt});
     if ( !exists($$hdr{curated}) ) { $$set{has_precision_recall} = 0; return; }
+    if ( $self->is_finished($outfile) ) { return; }
     my $ntp_tot = $self->ntp_tot($$set{raw},$$flt{type});
     my $iqual = $$hdr{rank};
     my $ipass = $$hdr{pass};
@@ -1035,10 +1039,13 @@ sub calc_csq_by_qual_snv
     open($fh,'>',"$outfile.r") or $self->throw("$outfile.r: $!");
     print $fh qq[
 
+        # otherwise 100000 is written as 1e+05 and out of sync error is thrown by the pipeline
+        options(scipen = 999)
+
         # read the data in: qual,nsyn,nmis,size
-        x <- read.csv("$outfile.part",sep="\\t",header=FALSE)
+        x <- read.csv("$outfile.part",sep="\\t",header=FALSE,colClasses=c("character", "numeric", "numeric", "numeric"))
         results <- data.frame(
-            qual    = numeric(),
+            qual    = character(),
             oe_syn  = numeric(),
             lo_syn  = numeric(),
             hi_syn  = numeric(),
@@ -1106,9 +1113,12 @@ sub calc_oesize_by_qual
     my $iqual = $$hdr{rank};
     my $itgt  = $$hdr{tgt};
     my $ipass = $$hdr{pass};
-    if ( !defined($itgt) ) { return; }
-    my $gsize = (grep {chomp} $self->cmd(qq[zcat $$set{targets} | awk '{s+=\$3-\$2+1}END{print s/1e6}']))[0];
-    if ( $gsize ne $$set{gsize} ) { $self->warn("\nWarning: gsize is different in $$self{targets}: targets=$gsize vs gsize=$$set{gsize}\n\n"); }
+    my $gsize = $$set{gsize};
+    if ( defined($itgt) )
+    {
+        $gsize = (grep {chomp} $self->cmd(qq[zcat $$set{targets} | awk '{s+=\$3-\$2+1}END{print s/1e6}']))[0];
+        if ( $gsize ne $$set{gsize} ) { $self->warn("\nWarning: gsize is different in $$self{targets}: targets=$gsize vs gsize=$$set{gsize}\n\n"); }
+    }
     my $nexp = $$set{nsmpl} * $gsize * 1e6 * $$self{"mrate_$$flt{type}"};
     my $cmd = qq[stats q -c qs | gzip -c > $outfile.part];
     print STDERR "$cmd\n";
@@ -1127,7 +1137,7 @@ sub calc_oesize_by_qual
             if ( $x eq $$flt{ifunc} ) { $is_pass = 1; last; }
         }
         if ( !$is_pass ) { next; }
-        my $is_tgt = $col[$itgt] eq 'tgt' ? 1 : 0;
+        my $is_tgt = (!defined $itgt or $col[$itgt] eq 'tgt') ? 1 : 0;
         print $fh join("\t",$col[$iqual],$is_tgt)."\n";
     }
     close($in) or $self->throw("close failed: gunzip -c $$set{flt}");
@@ -1136,10 +1146,13 @@ sub calc_oesize_by_qual
     open($fh,'>',"$outfile.r") or $self->throw("$outfile.r: $!");
     print $fh qq[
 
+        # otherwise 100000 is written as 1e+05 and out of sync error is thrown by the pipeline
+        options(scipen = 999)
+
         # read the data in: qual,nsyn,nmis,size
-        x <- read.csv("$outfile.part",sep="\\t",header=FALSE)
+        x <- read.csv("$outfile.part",sep="\\t",header=FALSE,colClasses=c("character", "numeric", "numeric"))
         results <- data.frame(
-            qual = numeric(),
+            qual = character(),
             oe_size = numeric(),
             lo_size = numeric(),
             hi_size = numeric(),
@@ -1359,7 +1372,7 @@ sub write_html
     my $color1 = 'orange';
     my $label  = defined($$set{label}) ? $$set{label} : $$set{name};
     $label .= ", $$set{nsmpl} samples";
-    my $sort_by = ref($$self{sort_by}) eq 'ARRAY' ? join(';',@{$$self{sort_by}}) : $$self{sort_by};
+    my $sort_by = ref($$set{sort_by}) eq 'ARRAY' ? join(';',@{$$set{sort_by}}) : $$set{sort_by};
 
     my $d3js = qq[<script type="text/javascript" src="$$self{d3_url}"></script>];
     my $pakojs = $$self{compress} ? qq[<script type="text/javascript" src="$$self{pako_url}"></script>] : '';
@@ -1928,6 +1941,7 @@ EOT
             let frm = null;
             let precision = null;
             let recall = null;
+            let tpr = null;
             if ( data[j].hasOwnProperty('titv') )
             {
                 titv = data[j].titv.toFixed(2);
