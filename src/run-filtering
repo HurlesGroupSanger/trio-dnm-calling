@@ -1705,6 +1705,7 @@ EOT
 
         // expanded expressions
         d3.select('#expr'+idx).classed("hovered",show==1 ? 1 : 0);
+        d3.select('#tr'+idx).classed("hovered",show==1 ? 1 : 0);
 
         // lines of the graph
         obj.graph.selectAll("#line"+idx)
