@@ -28,3 +28,5 @@ Suggested usage:
    run-trio-dnm +config trio-dnm.conf -o outdir -s out.candidates/sites.txt.gz +local
    run-trio-dnm +config trio-dnm.conf -o outdir -s out.candidates/sites.txt.gz +loop 300
    ```
+
+For more detail about the underlying commands, see the paper (REF) and the documentation ([TrioDNM](https://samtools.github.io/bcftools/howtos/plugin.trio-dnm3.html) and [VRFS](https://samtools.github.io/bcftools/howtos/plugin.vrfs.html)).
